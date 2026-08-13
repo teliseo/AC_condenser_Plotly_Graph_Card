@@ -1,48 +1,126 @@
+# Home Assistant Plotly Graph Card
+# A/C condenser power, with clipped display rails and Stage-2 emphasis.
+#
+# Paste this entire file into the card's "Show code editor" in a
+# GUI-managed Home Assistant dashboard.
+#
+# Visible Y range: 1800..3200 W
+# Actual values outside that range are plotted ON the appropriate rail,
+# but hover text reports the original, unclamped value.
+#
+# Marker meanings:
+#   x             : power < 1 W  (power disconnected / anomaly)
+#   square        : 60..80 W     (normal condenser-not-running draw)
+#   triangle-down : other values below 1800 W
+#   circle        : 1800..3200 W
+#   triangle-up   : values above 3200 W (including compressor start spike)
+#
+# Stage 2:
+#   sensor.stage2_current is fetched but not displayed as its own trace.
+#   For each total_power sample, the most recent Stage-2 current sample at
+#   or before that timestamp is used.
+#   If Stage-2 current > 0.07 A, the main power marker is larger and fully
+#   opaque; otherwise it is smaller and partially transparent.
+
 type: custom:plotly-graph
 title: A/C Condenser Power
-hours_to_show: 24
+hours_to_show: 24h
 
 entities:
-  - entity: sensor.ac_condenser_power
+  # Historical helper trace only. It is not drawn and does not consume
+  # another visible Y axis.
+  - entity: sensor.stage2_current
+    internal: true
+    extend_to_present: false
+    filters:
+      - map_y: parseFloat(y)
+      - store_var: stage2_current
+
+  - entity: sensor.total_power
     name: Condenser Power
     unit_of_measurement: W
-
     mode: lines+markers
     extend_to_present: false
 
-    # Preserve the REAL wattage for hover text.
-    # This is evaluated before the y-value clamp below.
+    # Match each power timestamp to the most recent Stage-2-current sample
+    # at or before that timestamp. Store the result for properties below.
+    fn: |
+      $fn ({xs, vars}) => {
+        const stage2_xs = vars.stage2_current?.xs ?? [];
+        const stage2_ys = vars.stage2_current?.ys ?? [];
+
+        let j = 0;
+        let last_stage2 = NaN;
+
+        vars.stage2_at_power = xs.map((x) => {
+          const power_time = new Date(x).getTime();
+
+          while (
+            j < stage2_xs.length &&
+            new Date(stage2_xs[j]).getTime() <= power_time
+          ) {
+            const value = Number(stage2_ys[j]);
+            if (Number.isFinite(value)) {
+              last_stage2 = value;
+            }
+            j++;
+          }
+
+          return last_stage2;
+        });
+
+        return null;
+      }
+
+    # Keep the original, unclamped wattage associated with every point.
     customdata: |
       $fn ({states}) =>
-        states.map(s => ({
-          actual: Number(s.state)
+        states.map(({state}) => ({
+          actual_watts: Number(state)
         }))
 
-    # Optional but useful:
-    #   normal point      = circle
-    #   below 1800 W      = triangle-down
-    #   above 3200 W      = triangle-up
-    #   exactly 0 W       = X
     marker:
-      size: 6
       symbol: |
         $fn ({states}) =>
-          states.map(s => {
-            const v = Number(s.state);
-            if (v === 0) return "x";
+          states.map(({state}) => {
+            const v = Number(state);
+
+            if (!Number.isFinite(v)) return "circle-open";
+            if (v < 1) return "x";
+            if (v >= 60 && v <= 80) return "square";
             if (v < 1800) return "triangle-down";
             if (v > 3200) return "triangle-up";
             return "circle";
           })
 
+      # Stage 2 active => visibly bolder point.
+      # Rail markers are larger than ordinary in-range markers.
+      size: |
+        $fn ({states, vars}) =>
+          states.map(({state}, i) => {
+            const v = Number(state);
+            const is_rail =
+              Number.isFinite(v) && (v < 1800 || v > 3200);
+            const base_size = is_rail ? 8 : 5;
+            const stage2_active = vars.stage2_at_power?.[i] > 0.07;
+
+            return stage2_active ? base_size + 3 : base_size;
+          })
+
+      opacity: |
+        $fn ({states, vars}) =>
+          states.map((_, i) =>
+            vars.stage2_at_power?.[i] > 0.07 ? 1.0 : 0.60
+          )
+
     hovertemplate: |
       <b>Condenser Power</b><br>
       %{x}<br>
-      %{customdata.actual:.0f} W
+      %{customdata.actual_watts:.0f} W
       <extra></extra>
 
-    # Change ONLY the coordinate sent to Plotly.
-    # Original value remains in customdata.actual.
+    # Clamp only the coordinate plotted on the Y axis.
+    # The actual value remains untouched in customdata.actual_watts.
     filters:
       - map_y_numbers: Math.max(1800, Math.min(3200, y))
 
@@ -56,4 +134,5 @@ layout:
     fixedrange: true
 
 config:
+  # Y is fixed, so wheel/drag zooming affects the time axis.
   scrollZoom: true
