@@ -4,23 +4,24 @@
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
 #
-# Visible Y range: 1800..3200 W
+# Visible Y range: controlled by Y_MIN_W and Y_MAX_W below.
 # Actual values outside that range are plotted ON the appropriate rail,
 # but hover text reports the original, unclamped value.
 #
 # Marker meanings:
 #   x             : power < 1 W  (power disconnected / anomaly)
 #   square        : 60..80 W     (normal condenser-not-running draw)
-#   triangle-down : other values below 1800 W
-#   circle        : 1800..3200 W
-#   triangle-up   : values above 3200 W (including compressor start spike)
+#   triangle-down : other values below Y_MIN_W
+#   circle        : Y_MIN_W..Y_MAX_W
+#   triangle-up   : values above Y_MAX_W (including compressor start spike)
 #
 # Stage 2:
 #   sensor.ac_stage2_current is fetched but not displayed as its own trace.
-#   For each total_power sample, the most recent Stage-2 current sample at
-#   or before that timestamp is used.
-#   If Stage-2 current > 0.07 A, the main power marker is larger and fully
-#   opaque; otherwise it is smaller and partially transparent.
+#   For each ac_total_power sample, the nearest Stage-2-current sample within
+#   +/- MATCH_TOLERANCE_MS is used. If no Stage-2 sample is that close, the
+#   most recent earlier Stage-2 value is used.
+#   Stage-2-active power points use dark green markers; all markers remain
+#   small and fully opaque.
 
 type: custom:plotly-graph
 title: A/C Condenser Power
@@ -32,6 +33,25 @@ entities:
   - entity: sensor.ac_stage2_current
     internal: true
     extend_to_present: false
+
+    # ================================================================
+    # EASY-TO-CHANGE CONSTANTS
+    # Change these values here; the rest of the card references them.
+    # ================================================================
+    fn: |
+      $fn ({vars}) => {
+        vars.cfg = {
+          Y_MIN_W: 1800,
+          Y_MAX_W: 3200,
+          STAGE2_THRESHOLD_A: 0.07,
+          MATCH_TOLERANCE_MS: 100,
+          NORMAL_COLOR: "#ff9800",
+          STAGE2_COLOR: "#006400",
+          MARKER_SIZE_PX: 5
+        };
+        return null;
+      }
+
     filters:
       - map_y: parseFloat(y)
       - store_var: stage2_current
@@ -42,12 +62,16 @@ entities:
     mode: lines+markers
     extend_to_present: false
 
-    # Match each power timestamp to the most recent Stage-2-current sample
-    # at or before that timestamp. Store the result for properties below.
+    # For each power point:
+    #   1. Prefer the nearest Stage-2 sample within +/- MATCH_TOLERANCE_MS.
+    #   2. Otherwise use the most recent earlier Stage-2 value.
+    # This does NOT alter, resample, add, remove, or move power points.
     fn: |
       $fn ({xs, vars}) => {
+        const cfg = vars.cfg;
         const stage2_xs = vars.stage2_current?.xs ?? [];
         const stage2_ys = vars.stage2_current?.ys ?? [];
+        const tolerance = cfg.MATCH_TOLERANCE_MS;
 
         let j = 0;
         let last_stage2 = NaN;
@@ -55,6 +79,7 @@ entities:
         vars.stage2_at_power = xs.map((x) => {
           const power_time = new Date(x).getTime();
 
+          // Advance j until it is the first Stage-2 point AFTER power_time.
           while (
             j < stage2_xs.length &&
             new Date(stage2_xs[j]).getTime() <= power_time
@@ -66,71 +91,97 @@ entities:
             j++;
           }
 
-          return last_stage2;
+          let nearest_value = NaN;
+          let nearest_delta = Infinity;
+
+          // Candidate immediately before / at the power timestamp.
+          if (j > 0) {
+            const t = new Date(stage2_xs[j - 1]).getTime();
+            const v = Number(stage2_ys[j - 1]);
+            const delta = Math.abs(t - power_time);
+            if (Number.isFinite(v) && delta < nearest_delta) {
+              nearest_value = v;
+              nearest_delta = delta;
+            }
+          }
+
+          // Candidate immediately after the power timestamp.
+          if (j < stage2_xs.length) {
+            const t = new Date(stage2_xs[j]).getTime();
+            const v = Number(stage2_ys[j]);
+            const delta = Math.abs(t - power_time);
+            if (Number.isFinite(v) && delta < nearest_delta) {
+              nearest_value = v;
+              nearest_delta = delta;
+            }
+          }
+
+          return nearest_delta <= tolerance ? nearest_value : last_stage2;
         });
 
         return null;
       }
 
-    # Keep the original, unclamped wattage associated with every point.
+    # Keep the original, unclamped wattage and the matched Stage-2 value
+    # associated with every power point for hover display.
     customdata: |
-      $fn ({states}) =>
-        states.map(({state}) => ({
-          actual_watts: Number(state)
+      $fn ({states, vars}) =>
+        states.map(({state}, i) => ({
+          actual_watts: Number(state),
+          stage2_current: vars.stage2_at_power?.[i]
         }))
 
     marker:
       symbol: |
-        $fn ({states}) =>
+        $fn ({states, vars}) =>
           states.map(({state}) => {
             const v = Number(state);
+            const cfg = vars.cfg;
 
             if (!Number.isFinite(v)) return "circle-open";
             if (v < 1) return "x";
             if (v >= 60 && v <= 80) return "square";
-            if (v < 1800) return "triangle-down";
-            if (v > 3200) return "triangle-up";
+            if (v < cfg.Y_MIN_W) return "triangle-down";
+            if (v > cfg.Y_MAX_W) return "triangle-up";
             return "circle";
           })
 
-      # Stage 2 active => visibly bolder point.
-      # Rail markers are larger than ordinary in-range markers.
-      size: |
-        $fn ({states, vars}) =>
-          states.map(({state}, i) => {
-            const v = Number(state);
-            const is_rail =
-              Number.isFinite(v) && (v < 1800 || v > 3200);
-            const base_size = is_rail ? 8 : 5;
-            const stage2_active = vars.stage2_at_power?.[i] > 0.07;
+      # Every marker remains the same small size and is fully opaque.
+      size: $ex vars.cfg.MARKER_SIZE_PX
+      opacity: 1
 
-            return stage2_active ? base_size + 3 : base_size;
-          })
-
-      opacity: |
+      # Stage 2 affects ONLY the marker color. No power points are moved
+      # or resampled to align with the Stage-2 history.
+      color: |
         $fn ({states, vars}) =>
           states.map((_, i) =>
-            vars.stage2_at_power?.[i] > 0.07 ? 1.0 : 0.60
+            vars.stage2_at_power?.[i] > vars.cfg.STAGE2_THRESHOLD_A
+              ? vars.cfg.STAGE2_COLOR
+              : vars.cfg.NORMAL_COLOR
           )
 
     hovertemplate: |
       <b>Condenser Power</b><br>
       %{x}<br>
-      %{customdata.actual_watts:.0f} W
+      %{customdata.actual_watts:.0f} W<br>
+      Stage 2: %{customdata.stage2_current:.3f} A
       <extra></extra>
 
     # Clamp only the coordinate plotted on the Y axis.
     # The actual value remains untouched in customdata.actual_watts.
     filters:
-      - map_y_numbers: Math.max(1800, Math.min(3200, y))
+      - map_y_numbers: Math.max(vars.cfg.Y_MIN_W, Math.min(vars.cfg.Y_MAX_W, y))
 
 layout:
+  # In a Panel view, this makes the graph approximately fill the browser
+  # viewport vertically as well as horizontally. Adjust 110 if your HA
+  # header/navigation consumes a different amount of vertical space.
+  height: $ex Math.max(500, window.innerHeight - 110)
+
   yaxis:
     title:
       text: Power (W)
-    range:
-      - 1800
-      - 3200
+    range: $ex [vars.cfg.Y_MIN_W, vars.cfg.Y_MAX_W]
     fixedrange: true
 
 config:
