@@ -16,7 +16,7 @@
 #   triangle-up   : values above 3200 W (including compressor start spike)
 #
 # Stage 2:
-#   sensor.stage2_current is fetched but not displayed as its own trace.
+#   sensor.ac_stage2_current is fetched but not displayed as its own trace.
 #   For each total_power sample, the most recent Stage-2 current sample at
 #   or before that timestamp is used.
 #   If Stage-2 current > 0.07 A, the main power marker is larger and fully
@@ -29,14 +29,14 @@ hours_to_show: 24h
 entities:
   # Historical helper trace only. It is not drawn and does not consume
   # another visible Y axis.
-  - entity: sensor.stage2_current
+  - entity: sensor.ac_stage2_current
     internal: true
     extend_to_present: false
     filters:
       - map_y: parseFloat(y)
       - store_var: stage2_current
 
-  - entity: sensor.total_power
+  - entity: sensor.ac_total_power
     name: Condenser Power
     unit_of_measurement: W
     mode: lines+markers
