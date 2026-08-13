@@ -1,0 +1,59 @@
+type: custom:plotly-graph
+title: A/C Condenser Power
+hours_to_show: 24
+
+entities:
+  - entity: sensor.ac_condenser_power
+    name: Condenser Power
+    unit_of_measurement: W
+
+    mode: lines+markers
+    extend_to_present: false
+
+    # Preserve the REAL wattage for hover text.
+    # This is evaluated before the y-value clamp below.
+    customdata: |
+      $fn ({states}) =>
+        states.map(s => ({
+          actual: Number(s.state)
+        }))
+
+    # Optional but useful:
+    #   normal point      = circle
+    #   below 1800 W      = triangle-down
+    #   above 3200 W      = triangle-up
+    #   exactly 0 W       = X
+    marker:
+      size: 6
+      symbol: |
+        $fn ({states}) =>
+          states.map(s => {
+            const v = Number(s.state);
+            if (v === 0) return "x";
+            if (v < 1800) return "triangle-down";
+            if (v > 3200) return "triangle-up";
+            return "circle";
+          })
+
+    hovertemplate: |
+      <b>Condenser Power</b><br>
+      %{x}<br>
+      %{customdata.actual:.0f} W
+      <extra></extra>
+
+    # Change ONLY the coordinate sent to Plotly.
+    # Original value remains in customdata.actual.
+    filters:
+      - map_y_numbers: Math.max(1800, Math.min(3200, y))
+
+layout:
+  yaxis:
+    title:
+      text: Power (W)
+    range:
+      - 1800
+      - 3200
+    fixedrange: true
+
+config:
+  scrollZoom: true
