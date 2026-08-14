@@ -397,22 +397,23 @@ entities:
 
 layout:
   # Runtime-only glue for sticky-live behavior. No installed JS files are
-  # changed. composedPath() identifies the exact card through HA shadow roots.
+  # changed. A capture-phase pointer/wheel listener identifies the exact card
+  # before Plotly handles the interaction, then installs a direct
+  # plotly_relayout listener on that card.
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV23Runtime";
-      const OLD_RUNTIME_KEY = "__acCondenserPlotV22Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV24Runtime";
+      const OLD_RUNTIME_KEY = "__acCondenserPlotV23Runtime";
 
       window[STATE_KEY] ??= {
-        power: window.__acCondenserPlotV22State?.power ?? true,
-        stage2: window.__acCondenserPlotV22State?.stage2 ?? false,
+        power: true,
+        stage2: false,
         live: true,
         liveHours: 24
       };
 
-      // Remove v22's global listeners if this YAML is hot-reloaded without a
-      // full browser refresh.
+      // Remove v23's global listeners on a hot reload.
       const old = window[OLD_RUNTIME_KEY];
       if (old) {
         if (old.on_pointerup) {
@@ -439,31 +440,51 @@ layout:
       const card_from_event = (event) =>
         event?.composedPath?.().find(is_target_card);
 
-      const update_mode = (host) => {
+      const to_ms = (v) => {
+        if (typeof v === "number") return v;
+        if (v instanceof Date) return v.getTime();
+        const ms = new Date(v).getTime();
+        return Number.isFinite(ms) ? ms : NaN;
+      };
+
+      const range_from_relayout = (event_data) => {
+        if (Array.isArray(event_data?.["xaxis.range"])) {
+          return event_data["xaxis.range"];
+        }
+
+        if (
+          event_data?.["xaxis.range[0]"] !== undefined &&
+          event_data?.["xaxis.range[1]"] !== undefined
+        ) {
+          return [
+            event_data["xaxis.range[0]"],
+            event_data["xaxis.range[1]"]
+          ];
+        }
+
+        return null;
+      };
+
+      const apply_range_mode = (host, raw_range) => {
         if (!is_target_card(host)) return;
 
-        // Permanently suppress this card's built-in browsing-reset button.
-        // Our explicit ↻ 24h control is the reset.
+        // Our explicit ↻ 24h control replaces the card's reset button.
         if (host.resetButtonEl) {
           host.resetButtonEl.style.display = "none";
         }
 
-        const r = host.getVisibleRange?.();
-        if (!Array.isArray(r) || r.length !== 2) return;
-
-        const a = Number(r[0]);
-        const b = Number(r[1]);
+        const a = to_ms(raw_range?.[0]);
+        const b = to_ms(raw_range?.[1]);
         const width = b - a;
-        if (!(width > 0)) return;
+        if (!Number.isFinite(a) || !Number.isFinite(b) || !(width > 0)) {
+          return;
+        }
 
         const state = window[STATE_KEY];
         const now = Date.now();
 
         const raw_max = host.contentEl?.layout?.xaxis?.maxallowed;
-        const max_allowed =
-          typeof raw_max === "number"
-            ? raw_max
-            : new Date(raw_max).getTime();
+        const max_allowed = to_ms(raw_max);
 
         const at_right_edge =
           b >= now - 5000 ||
@@ -473,39 +494,59 @@ layout:
           );
 
         if (at_right_edge) {
-          const new_live_hours = width / (60 * 60 * 1000);
-          const width_changed =
-            Math.abs((state.liveHours ?? 24) - new_live_hours) > 1e-6;
-          const was_live = state.live;
-          const was_browsing = host.isBrowsing;
-
           state.live = true;
-          state.liveHours = new_live_hours;
+          state.liveHours = width / (60 * 60 * 1000);
 
-          // Exit browsing, but DO NOT reset to configured 24h. The top-level
-          // hours_to_show function now evaluates to this saved zoom width.
+          // The card's own relayout listener has just entered browsing mode.
+          // Overwrite that before its debounced replot runs.  The replot then
+          // evaluates hours_to_show as "last <current zoom width>".
           host.isBrowsing = false;
           host.configParser?.resetObservedRange?.();
-
-          // Replot only if something actually changed. v22 tested
-          // host.isBrowsing after assigning false, so this was always true
-          // and could race Plotly's delayed legend toggle.
-          if (!was_live || was_browsing || width_changed) {
-            host.plot({should_fetch: true});
-          }
           return;
         }
 
-        // Historical position: keep the card's ordinary fixed browsing range.
-        // Replot only if the mode indicator actually needs to change.
-        const was_live = state.live;
+        // Away from the right edge, leave the card in the browsing mode that
+        // its own relayout handler just selected.
         state.live = false;
-        if (was_live) {
-          host.plot({should_fetch: false});
+      };
+
+      const ensure_host = (host) => {
+        if (!is_target_card(host)) return;
+
+        if (host.resetButtonEl) {
+          host.resetButtonEl.style.display = "none";
+        }
+
+        if (!host.__acCondenserV24RelayoutHandler) {
+          const handler = (event_data) => {
+            if (host.isInternalRelayout) return;
+
+            const range = range_from_relayout(event_data);
+            if (!range) return;
+
+            apply_range_mode(host, range);
+          };
+
+          host.contentEl?.on?.("plotly_relayout", handler);
+          host.__acCondenserV24RelayoutHandler = handler;
         }
       };
 
       if (!window[RUNTIME_KEY]) {
+        // Install the direct Plotly listener BEFORE an interaction can emit
+        // plotly_relayout.  composedPath() crosses HA shadow-root boundaries.
+        const attach_from_event = (event) => {
+          const host = card_from_event(event);
+          if (host) ensure_host(host);
+        };
+
+        const on_pointerdown = (event) => attach_from_event(event);
+        const on_touchstart = (event) => attach_from_event(event);
+        const on_wheel = (event) => attach_from_event(event);
+
+        // A legend toggle emits plotly_restyle, and the card treats restyle as
+        // browsing.  If we were already live, restore normal/live mode only
+        // after Plotly's delayed single-click legend action has completed.
         const is_legend_event = (event) =>
           event?.composedPath?.().some((el) => {
             const raw =
@@ -519,47 +560,50 @@ layout:
             );
           });
 
-        const schedule = (event, delay = 100) => {
+        const on_pointerup = (event) => {
+          if (!is_legend_event(event)) return;
+
           const host = card_from_event(event);
           if (!host) return;
+          ensure_host(host);
 
-          // Plotly delays a normal legend click while waiting to see whether
-          // it becomes a double-click. Recover live mode only after that
-          // delayed native restyle has completed.
-          if (is_legend_event(event)) {
-            const double_click_delay =
-              host.contentEl?._context?.doubleClickDelay ?? 300;
-            delay = Math.max(delay, double_click_delay + 120);
-          }
+          const state = window[STATE_KEY];
+          if (!state.live) return;
 
-          clearTimeout(host.__acCondenserLiveEdgeTimer);
-          host.__acCondenserLiveEdgeTimer = setTimeout(
-            () => update_mode(host),
-            delay
-          );
+          const double_click_delay =
+            host.contentEl?._context?.doubleClickDelay ?? 300;
+
+          clearTimeout(host.__acCondenserLegendLiveTimer);
+          host.__acCondenserLegendLiveTimer = setTimeout(() => {
+            if (!state.live) return;
+
+            host.isBrowsing = false;
+            if (host.resetButtonEl) {
+              host.resetButtonEl.style.display = "none";
+            }
+            host.configParser?.resetObservedRange?.();
+          }, double_click_delay + 350);
         };
 
-        const on_pointerup = (event) => schedule(event, 140);
-        const on_touchend = (event) => schedule(event, 170);
-        const on_wheel = (event) => schedule(event, 220);
-
-        window.addEventListener("pointerup", on_pointerup, true);
-        window.addEventListener("touchend", on_touchend, true);
+        window.addEventListener("pointerdown", on_pointerdown, true);
+        window.addEventListener("touchstart", on_touchstart, true);
         window.addEventListener(
           "wheel",
           on_wheel,
           {capture: true, passive: true}
         );
+        window.addEventListener("pointerup", on_pointerup, true);
 
         window[RUNTIME_KEY] = {
-          update_mode,
-          on_pointerup,
-          on_touchend,
-          on_wheel
+          ensure_host,
+          on_pointerdown,
+          on_touchstart,
+          on_wheel,
+          on_pointerup
         };
       }
 
-      return "ac-condenser-v23";
+      return "ac-condenser-v24";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
@@ -592,11 +636,10 @@ layout:
     spikethickness: 1
     spikecolor: "#808080"
 
-  # Navigation remains on Plotly's proven native relayout path. The runtime
-  # listener converts a completed right-edge interaction into normal live
-  # "last X" mode at the current zoom width.
+  # One horizontal menu is intentional. Plotly applies 12 px of text
+  # padding to each side of every button and a 2 px gap between adjacent
+  # buttons, so the whitespace on both sides of ↻ 24h is exactly equal.
   updatemenus:
-    # Back and reset controls.
     - buttons:
         - label: "◀ ¼"
           method: relayout
@@ -640,39 +683,8 @@ layout:
                 return [end - 24 * 60 * 60 * 1000, end];
               }
 
-      direction: right
-      active: -1
-      showactive: false
-      type: buttons
-      bgcolor: "rgba(0,0,0,0)"
-      bordercolor: "rgba(0,0,0,0)"
-      borderwidth: 0
-      font:
-        size: 12
-      x: 0.42
-      xanchor: left
-      "y": 1.02
-      yanchor: bottom
-      pad:
-        l: 0
-        r: 0
-        t: 0
-        b: 0
-
-    # Forward control doubles as the live/right-edge indicator.
-    # When live it becomes grey "LIVE ▶" and execute:false makes it inert.
-    - buttons:
-        - label: |
-            $fn () => {
-              window.__acCondenserPlotV22State ??= {
-                power: true,
-                stage2: false,
-                live: true,
-                liveHours: 24
-              };
-              return window.__acCondenserPlotV22State.live ? "LIVE ▶" : "¼ ▶";
-            }
-          execute: |
+        # Historical forward control. Hidden while live.
+        - visible: |
             $fn () => {
               window.__acCondenserPlotV22State ??= {
                 power: true,
@@ -682,6 +694,7 @@ layout:
               };
               return !window.__acCondenserPlotV22State.live;
             }
+          label: "¼ ▶"
           method: relayout
           args:
             - xaxis.range
@@ -716,6 +729,23 @@ layout:
                 return [new_end - width, new_end];
               }
 
+        # Live/right-edge indicator occupies the exact same third-button slot.
+        # execute:false makes it inert. The hollow arrow distinguishes the
+        # disabled state without requiring a separately-positioned menu.
+        - visible: |
+            $fn () => {
+              window.__acCondenserPlotV22State ??= {
+                power: true,
+                stage2: false,
+                live: true,
+                liveHours: 24
+              };
+              return window.__acCondenserPlotV22State.live;
+            }
+          label: "LIVE ▷"
+          method: skip
+          execute: false
+
       direction: right
       active: -1
       showactive: false
@@ -725,20 +755,7 @@ layout:
       borderwidth: 0
       font:
         size: 12
-        color: |
-          $fn ({css_vars}) => {
-            window.__acCondenserPlotV22State ??= {
-              power: true,
-              stage2: false,
-              live: true,
-              liveHours: 24
-            };
-            return window.__acCondenserPlotV22State.live
-              ? css_vars["secondary-text-color"]
-              : css_vars["primary-text-color"];
-          }
-      # Immediately follows the back/reset control group.
-      x: 0.495
+      x: 0.42
       xanchor: left
       "y": 1.02
       yanchor: bottom
