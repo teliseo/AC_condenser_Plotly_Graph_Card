@@ -401,8 +401,8 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV22Runtime";
-      const OLD_RUNTIME_KEY = "__acCondenserPlotV21Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV23Runtime";
+      const OLD_RUNTIME_KEY = "__acCondenserPlotV22Runtime";
 
       window[STATE_KEY] ??= {
         power: window.__acCondenserPlotV22State?.power ?? true,
@@ -411,7 +411,7 @@ layout:
         liveHours: 24
       };
 
-      // Remove v21's global listeners if this YAML is hot-reloaded without a
+      // Remove v22's global listeners if this YAML is hot-reloaded without a
       // full browser refresh.
       const old = window[OLD_RUNTIME_KEY];
       if (old) {
@@ -476,6 +476,8 @@ layout:
           const new_live_hours = width / (60 * 60 * 1000);
           const width_changed =
             Math.abs((state.liveHours ?? 24) - new_live_hours) > 1e-6;
+          const was_live = state.live;
+          const was_browsing = host.isBrowsing;
 
           state.live = true;
           state.liveHours = new_live_hours;
@@ -485,9 +487,10 @@ layout:
           host.isBrowsing = false;
           host.configParser?.resetObservedRange?.();
 
-          // Replot immediately when entering live mode or changing live width.
-          // In normal mode, later HA updates continue advancing "last X".
-          if (width_changed || host.isBrowsing === false) {
+          // Replot only if something actually changed. v22 tested
+          // host.isBrowsing after assigning false, so this was always true
+          // and could race Plotly's delayed legend toggle.
+          if (!was_live || was_browsing || width_changed) {
             host.plot({should_fetch: true});
           }
           return;
@@ -503,9 +506,31 @@ layout:
       };
 
       if (!window[RUNTIME_KEY]) {
+        const is_legend_event = (event) =>
+          event?.composedPath?.().some((el) => {
+            const raw =
+              el?.className?.baseVal ??
+              el?.className ??
+              "";
+            const cls = String(raw);
+            return (
+              cls.includes("legend") ||
+              cls.includes("traces")
+            );
+          });
+
         const schedule = (event, delay = 100) => {
           const host = card_from_event(event);
           if (!host) return;
+
+          // Plotly delays a normal legend click while waiting to see whether
+          // it becomes a double-click. Recover live mode only after that
+          // delayed native restyle has completed.
+          if (is_legend_event(event)) {
+            const double_click_delay =
+              host.contentEl?._context?.doubleClickDelay ?? 300;
+            delay = Math.max(delay, double_click_delay + 120);
+          }
 
           clearTimeout(host.__acCondenserLiveEdgeTimer);
           host.__acCondenserLiveEdgeTimer = setTimeout(
@@ -534,7 +559,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v22";
+      return "ac-condenser-v23";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
@@ -712,7 +737,8 @@ layout:
               ? css_vars["secondary-text-color"]
               : css_vars["primary-text-color"];
           }
-      x: 0.555
+      # Immediately follows the back/reset control group.
+      x: 0.495
       xanchor: left
       "y": 1.02
       yanchor: bottom
