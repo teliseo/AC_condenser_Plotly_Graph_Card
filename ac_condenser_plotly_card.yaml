@@ -92,6 +92,20 @@ entities:
     extend_to_present: false
     cliponaxis: false
 
+    # Build the plotted power Y values DIRECTLY from this entity's HA history
+    # states. This intentionally bypasses the card's shared/filter `ys` path,
+    # so the optional Stage-2 trace cannot affect power values.
+    "y": |
+      $fn ({states, vars}) =>
+        states.map(({state}) => {
+          const v = Number(state);
+          if (!Number.isFinite(v)) return null;
+          return Math.max(
+            vars.cfg.Y_MIN_W,
+            Math.min(vars.cfg.Y_MAX_W, v)
+          );
+        })
+
     # For each power point:
     #   1. Prefer the nearest Stage-2 sample within +/- MATCH_TOLERANCE_MS.
     #   2. Otherwise use the most recent earlier Stage-2 value.
@@ -253,12 +267,6 @@ entities:
       %{customdata.actual_watts:.0f} W<br>
       Stage-2 sample Δt: %{customdata.stage2_offset_text}
       <extra></extra>
-
-    # Clamp only the coordinate plotted on the Y axis.
-    # The actual value remains untouched in customdata.actual_watts.
-    filters:
-      - map_y_numbers: Math.max(vars.cfg.Y_MIN_W, Math.min(vars.cfg.Y_MAX_W, y))
-
 
   # Optional DISPLAY copy of Stage 2.
   # The separate internal copy above remains responsible for correlation.
