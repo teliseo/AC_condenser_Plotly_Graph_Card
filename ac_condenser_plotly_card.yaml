@@ -304,48 +304,6 @@ layout:
     visible: false
 
   updatemenus:
-    # Pan left/right by 1/4 of the currently visible X span.
-    - buttons:
-        - args:
-            - xaxis.range
-            - |
-              $fn ({getFromConfig}) => {
-                const range = getFromConfig("visible_range");
-                const width = range[1] - range[0];
-                return [
-                  range[0] - width * 0.25,
-                  range[1] - width * 0.25
-                ];
-              }
-          label: "←"
-          method: relayout
-
-        - args:
-            - xaxis.range
-            - |
-              $fn ({getFromConfig}) => {
-                const range = getFromConfig("visible_range");
-                const width = range[1] - range[0];
-                return [
-                  range[0] + width * 0.25,
-                  range[1] + width * 0.25
-                ];
-              }
-          label: "→"
-          method: relayout
-
-      direction: right
-      active: -1
-      showactive: false
-      type: buttons
-      x: 1
-      xanchor: right
-      "y": 1
-      yanchor: top
-      pad:
-        r: 4
-        t: 4
-
     # Toggle the Stage-2 trace AND its axis together. Trace index 0 is the
     # Stage-2 trace; trace index 1 is ac_total_power.
     - buttons:
