@@ -257,13 +257,14 @@ entities:
       - map_y_numbers: Math.max(vars.cfg.Y_MIN_W, Math.min(vars.cfg.Y_MAX_W, y))
 
 
-  # Visible Stage-2 trace. No explicit yaxis assignment and no axis geometry
-  # override; the card auto-groups A separately from W.
+  # Visible Stage-2 trace. Plotly Graph Card auto-groups A separately
+  # from W; do not explicitly assign yaxis or override axis geometry.
+  # Its legend item acts as the native show/hide toggle.
   - entity: sensor.ac_stage2_current
     name: Stage 2
     mode: markers
     extend_to_present: false
-    showlegend: false
+    showlegend: true
 
     marker:
       color: "#008b8b"
@@ -281,7 +282,7 @@ entities:
 
 layout:
   # In a Panel view, this makes the graph approximately fill the browser
-  # viewport vertically as well as horizontally. Adjust 110 if your HA
+  # viewport vertically as well as horizontally. Adjust 95 if your HA
   # header/navigation consumes a different amount of vertical space.
   height: $ex Math.max(100, window.innerHeight - 95)
 
