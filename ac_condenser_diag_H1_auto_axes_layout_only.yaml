@@ -1,0 +1,41 @@
+type: custom:plotly-graph
+hours_to_show: 24h
+
+entities:
+  - entity: sensor.ac_total_power
+    name: Total Power
+    mode: lines+markers
+    extend_to_present: false
+
+  - entity: sensor.ac_stage2_current
+    name: Stage 2 Current
+    mode: markers
+    extend_to_present: false
+
+layout:
+  height: $ex Math.max(100, window.innerHeight - 95)
+
+  # Let Plotly Graph Card auto-assign W and A to separate axes by unit.
+  # Only customize the axes it creates; do NOT set entity-level yaxis.
+  yaxis:
+    title:
+      text: Power (W)
+    range:
+      - 1600
+      - 3800
+    fixedrange: true
+
+  yaxis2:
+    title:
+      text: Stage 2 (A)
+    range:
+      - 0
+      - 0.12
+    fixedrange: true
+    overlaying: y
+    side: right
+    showgrid: false
+    zeroline: false
+
+config:
+  scrollZoom: true
