@@ -18,8 +18,10 @@
 # Stage 2:
 #   sensor.ac_stage2_current is fetched once internally for timestamp pairing
 #   and again as an optional visible trace. For each ac_total_power sample, the
-#   nearest Stage-2-current sample within +/- MATCH_TOLERANCE_MS is treated as
-#   timestamp-paired. Those Stage-2 samples are drawn as squares; unpaired
+#   first Stage-2-current sample at or AFTER the Total timestamp is treated
+#   as timestamp-paired only if it is within +MATCH_TOLERANCE_MS. A Stage-2
+#   sample before Total is never considered paired. Paired Stage-2 samples
+#   are drawn as squares; unpaired
 #   Stage-2 samples are circles. Stage-2 is hidden by default via legendonly.
 #   If no close pair exists, the most recent earlier Stage-2 value is still
 #   used to color the corresponding power point.
@@ -155,8 +157,9 @@ entities:
       }
 
     # For each power point:
-    #   1. Prefer the nearest Stage-2 sample within +/- MATCH_TOLERANCE_MS.
-    #   2. Otherwise use the most recent earlier Stage-2 value.
+    #   1. Pair only with the first Stage-2 sample at/after the Total timestamp,
+    #      and only when its offset is 0..+MATCH_TOLERANCE_MS.
+    #   2. Otherwise use the most recent earlier Stage-2 value for coloring.
     # This does NOT alter, resample, add, remove, or move power points.
     fn: |
       $fn ({states, vars}) => {
@@ -176,55 +179,37 @@ entities:
             state.last_updated ?? state.last_changed
           );
 
-          // Advance j until it is the first Stage-2 sample AFTER power_time.
+          // Advance j until it is the first Stage-2 sample at or AFTER
+          // power_time. Anything before Total is categorically not a pair.
           while (
             j < stage2_times.length &&
-            stage2_times[j] <= power_time
+            stage2_times[j] < power_time
           ) {
             j++;
           }
 
-          let nearest_index = -1;
-          let nearest_abs_delta = Infinity;
-          let nearest_signed_delta = NaN;
+          const candidate_index = j < stage2_times.length ? j : -1;
+          const candidate_delta =
+            candidate_index >= 0
+              ? stage2_times[candidate_index] - power_time
+              : NaN;
 
-          // Candidate immediately before / at the power timestamp.
-          if (j > 0) {
-            const delta = stage2_times[j - 1] - power_time;
-            if (
-              Number.isFinite(stage2_values[j - 1]) &&
-              Math.abs(delta) < nearest_abs_delta
-            ) {
-              nearest_index = j - 1;
-              nearest_abs_delta = Math.abs(delta);
-              nearest_signed_delta = delta;
-            }
-          }
+          const is_pair =
+            candidate_index >= 0 &&
+            Number.isFinite(stage2_values[candidate_index]) &&
+            Number.isFinite(candidate_delta) &&
+            candidate_delta >= 0 &&
+            candidate_delta <= tolerance_us;
 
-          // Candidate immediately after the power timestamp.
-          if (j < stage2_times.length) {
-            const delta = stage2_times[j] - power_time;
-            if (
-              Number.isFinite(stage2_values[j]) &&
-              Math.abs(delta) < nearest_abs_delta
-            ) {
-              nearest_index = j;
-              nearest_abs_delta = Math.abs(delta);
-              nearest_signed_delta = delta;
-            }
-          }
-
-          if (nearest_index >= 0 && nearest_abs_delta <= tolerance_us) {
-            // True paired sample: use it for styling and expose its exact
-            // signed timestamp offset in hover text.
-            vars.stage2_at_power.push(stage2_values[nearest_index]);
-            vars.stage2_match_offset_us.push(nearest_signed_delta);
-            vars.stage2_paired_times_us.add(stage2_times[nearest_index]);
+          if (is_pair) {
+            // True paired sample. Its offset is necessarily nonnegative.
+            vars.stage2_at_power.push(stage2_values[candidate_index]);
+            vars.stage2_match_offset_us.push(candidate_delta);
+            vars.stage2_paired_times_us.add(stage2_times[candidate_index]);
           } else {
-            // No near-simultaneous Stage-2 history point. The Stage-2 entity
-            // state is persistent, so use the latest earlier state for
-            // coloring, but do NOT report its potentially hours-old timestamp
-            // as though it were a paired sample.
+            // No paired Stage-2 history point. The Stage-2 entity state is
+            // persistent, so use only the latest STRICTLY EARLIER state for
+            // coloring. Never present that held timestamp as a pair.
             const held_index = j > 0 ? j - 1 : -1;
             vars.stage2_at_power.push(
               held_index >= 0 ? stage2_values[held_index] : NaN
@@ -236,17 +221,18 @@ entities:
         return null;
       }
 
-    # Keep the original, unclamped wattage and, only when a true
-    # +/- MATCH_TOLERANCE_MS pair exists, the signed Stage-2 timestamp offset.
+    # Keep the original, unclamped wattage and, only for a true forward
+    # pair, an entire optional Stage-2 hover line. For an unpaired Total point
+    # the string is empty, so there is no "no paired sample" message or label.
     customdata: |
       $fn ({states, vars}) =>
         states.map(({state}, i) => {
           const offset = vars.stage2_match_offset_us?.[i];
           return {
             actual_watts: Number(state),
-            stage2_offset_text: Number.isFinite(offset)
-              ? `${offset >= 0 ? "+" : ""}${Math.round(offset)} µs`
-              : "no paired sample"
+            stage2_offset_line: Number.isFinite(offset)
+              ? `Stage-2 sample Δt: +${Math.round(offset)} µs<br>`
+              : ""
           };
         })
 
@@ -315,8 +301,7 @@ entities:
       <b>Condenser Power</b><br>
       %{x|%Y-%m-%d %H:%M:%S.%L}<br>
       %{customdata.actual_watts:.0f} W<br>
-      Stage-2 sample Δt: %{customdata.stage2_offset_text}
-      <extra></extra>
+      %{customdata.stage2_offset_line}<extra></extra>
 
     # Clamp only the coordinate plotted on the Y axis.
     # The actual value remains untouched in customdata.actual_watts.
@@ -366,8 +351,8 @@ entities:
     marker:
       color: "#008b8b"
 
-      # A Stage-2 history point that was selected as a true +/- tolerance
-      # match for at least one power point is highlighted as a square.
+      # A Stage-2 history point selected as a true 0..+tolerance forward
+      # match for at least one Total point is highlighted as a square.
       symbol: |
         $fn ({states, vars}) =>
           states.map((s) => {
