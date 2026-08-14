@@ -1,0 +1,19 @@
+type: custom:plotly-graph
+hours_to_show: 24h
+
+entities:
+  - entity: sensor.ac_total_power
+    name: Total Power
+    mode: lines+markers
+    extend_to_present: false
+
+  - entity: sensor.ac_stage2_current
+    name: Stage 2 Current
+    mode: markers
+    extend_to_present: false
+
+layout:
+  height: $ex Math.max(100, window.innerHeight - 95)
+
+config:
+  scrollZoom: true
