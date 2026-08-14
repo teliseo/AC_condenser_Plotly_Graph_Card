@@ -16,7 +16,10 @@
 #   triangle-up   : values above Y_MAX_W (including compressor start spike)
 #
 # Stage 2:
-#   sensor.ac_stage2_current is fetched but not displayed as its own trace.
+#   sensor.ac_stage2_current is always fetched so it can color ac_total_power.
+#   Its own points are hidden by default and can be toggled with the "Stage 2"
+#   plot button. When shown, they are dark-cyan dots on a 0..120 mA right axis,
+#   with no connecting line.
 #   For each ac_total_power sample, the nearest Stage-2-current sample within
 #   +/- MATCH_TOLERANCE_MS is treated as a timestamp-paired sample. If none is
 #   that close, the most recent earlier Stage-2 value is still used for color.
@@ -26,12 +29,44 @@
 type: custom:plotly-graph
 hours_to_show: 24h
 
+# Custom Plotly buttons. visible_range is reevaluated by Plotly Graph Card,
+# so each click pans by 1/4 of whatever X width is currently visible.
+fn: |
+  $fn ({getFromConfig, vars}) => {
+    const range = getFromConfig("visible_range");
+    const width = range[1] - range[0];
+
+    vars.pan = (label, fraction) => ({
+      args: [
+        "xaxis.range",
+        [
+          range[0] + width * fraction,
+          range[1] + width * fraction
+        ]
+      ],
+      label,
+      method: "relayout"
+    });
+  }
+
 entities:
-  # Historical helper trace only. It is not drawn and does not consume
-  # another visible Y axis.
+  # Stage-2 history is used both for coloring the power trace and,
+  # optionally, as its own marker-only trace.
   - entity: sensor.ac_stage2_current
-    internal: true
+    name: Stage 2
+    visible: false
+    showlegend: false
+    mode: markers
+    yaxis: y2
     extend_to_present: false
+    marker:
+      color: "#008b8b"
+      size: 5
+    hovertemplate: |
+      <b>Stage 2</b><br>
+      %{x}<br>
+      %{y:.1f} mA
+      <extra></extra>
 
     # ================================================================
     # EASY-TO-CHANGE CONSTANTS
@@ -81,6 +116,10 @@ entities:
         return null;
       }
 
+    # Keep the matching values above in amperes, but plot this optional trace
+    # in milliamperes on its own 0..120 mA scale.
+    filters:
+      - map_y_numbers: y * 1000
 
   - entity: sensor.ac_total_power
     name: Condenser Power
@@ -258,7 +297,7 @@ entities:
 
 layout:
   # In a Panel view, this makes the graph approximately fill the browser
-  # viewport vertically as well as horizontally. Adjust 110 if your HA
+  # viewport vertically as well as horizontally. Adjust 95 if your HA
   # header/navigation consumes a different amount of vertical space.
   height: $ex Math.max(100, window.innerHeight - 95)
 
@@ -267,6 +306,64 @@ layout:
       text: Power (W)
     range: $ex [vars.cfg.Y_MIN_W, vars.cfg.Y_MAX_W]
     fixedrange: true
+
+  # Conventional overlaid secondary Y axis. It intentionally shares the
+  # full vertical plotting domain with the power axis.
+  yaxis2:
+    title:
+      text: Stage 2 (mA)
+    range:
+      - 0
+      - 120
+    fixedrange: true
+    overlaying: y
+    side: right
+    showgrid: false
+    zeroline: false
+    color: "#008b8b"
+    visible: false
+
+  updatemenus:
+    # Pan left/right by 1/4 of the currently visible X span.
+    - buttons:
+        - $fn ({vars}) => vars.pan("←", -0.25)
+        - $fn ({vars}) => vars.pan("→", 0.25)
+      direction: right
+      active: -1
+      showactive: false
+      type: buttons
+      x: 1
+      xanchor: right
+      "y": 1
+      yanchor: top
+      pad:
+        r: 4
+        t: 4
+
+    # Toggle the Stage-2 trace AND its axis together. Trace index 0 is the
+    # Stage-2 trace; trace index 1 is ac_total_power.
+    - buttons:
+        - label: Stage 2
+          method: update
+          args:
+            - visible: true
+            - yaxis2.visible: true
+            - - 0
+          args2:
+            - visible: false
+            - yaxis2.visible: false
+            - - 0
+      direction: right
+      active: -1
+      showactive: true
+      type: buttons
+      x: 0
+      xanchor: left
+      "y": 1
+      yanchor: top
+      pad:
+        l: 4
+        t: 4
 
 config:
   # Y is fixed, so wheel/drag zooming affects the time axis.
