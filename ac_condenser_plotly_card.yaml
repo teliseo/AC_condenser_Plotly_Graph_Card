@@ -87,6 +87,9 @@ entities:
   - entity: sensor.ac_total_power
     name: Condenser Power
     unit_of_measurement: W
+    visible: true
+    xaxis: x
+    yaxis: y
     mode: lines+markers
     extend_to_present: false
     cliponaxis: false
@@ -265,8 +268,9 @@ entities:
     name: Stage 2
     visible: false
     showlegend: false
-    mode: markers
+    xaxis: x
     yaxis: y2
+    mode: markers
     extend_to_present: false
 
     marker:
