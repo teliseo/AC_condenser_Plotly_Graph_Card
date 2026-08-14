@@ -33,6 +33,19 @@ hours_to_show: 24h
 # to the live 24-hour window.
 refresh_interval: auto
 
+# Work around Plotly Graph Card's rendered-trace fetch_mask being indexed
+# against the original entity list (which includes internal traces).
+# Entity order here is:
+#   0 internal Stage-2 helper
+#   1 condenser power
+#   2 visible Stage-2 trace
+# Forcing all true ensures historical panning always fetches every source,
+# even while Stage 2 is legend-hidden.
+fetch_mask:
+  - true
+  - true
+  - true
+
 entities:
   # Historical helper trace only. It is not drawn and does not consume
   # another visible Y axis.
@@ -81,40 +94,6 @@ entities:
           return whole_seconds_ms * 1000 + frac_us;
         };
 
-        // Find this Plotly Graph Card instance from callbacks. Home Assistant
-        // nests cards behind several shadow roots, so a normal querySelector
-        // from document is insufficient.
-        vars.find_card = () => {
-          if (vars.card?.isConnected) return vars.card;
-
-          const matches_this_card = (el) => {
-            if (el?.localName !== "plotly-graph") return false;
-            const ents = el.config?.entities ?? [];
-            const has_power = ents.some(
-              (e) => e?.entity === "sensor.ac_total_power"
-            );
-            const has_stage2 = ents.some(
-              (e) => e?.entity === "sensor.ac_stage2_current"
-            );
-            return has_power && has_stage2;
-          };
-
-          const walk = (root) => {
-            if (!root?.querySelectorAll) return null;
-            for (const el of root.querySelectorAll("*")) {
-              if (matches_this_card(el)) return el;
-              if (el.shadowRoot) {
-                const found = walk(el.shadowRoot);
-                if (found) return found;
-              }
-            }
-            return null;
-          };
-
-          vars.card = walk(document);
-          return vars.card;
-        };
-
         vars.stage2_times_us = states.map((s) =>
           vars.to_epoch_us(s.last_updated ?? s.last_changed)
         );
@@ -131,13 +110,14 @@ entities:
     extend_to_present: false
     cliponaxis: false
 
-    # Custom legend toggle: update BOTH this trace and its left axis in the
-    # card's persistent input config, then replot. Returning false suppresses
-    # Plotly's default restyle, so a legend click does not force browsing mode.
+    # Replace Plotly's native legend restyle with a persistent card-config
+    # update, so trace and axis visibility stay synchronized. The legend event
+    # supplies a DOM node inside this exact card, so no document traversal is
+    # required.
     on_legend_click: |
-      $fn ({vars}) => (event_data) => {
-        const host = vars.find_card?.();
-        if (!host) return true;
+      $fn () => (event_data) => {
+        const host = event_data.node?.getRootNode?.()?.host;
+        if (!host?.config) return true;
 
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
@@ -157,7 +137,7 @@ entities:
         host.config.layout.yaxis ??= {};
         host.config.layout.yaxis.visible = next_visible;
 
-        host.plot({should_fetch: next_visible});
+        host.plot({should_fetch: true});
         return false;
       }
 
@@ -343,12 +323,11 @@ entities:
     # "legendonly" keeps the legend toggle visible but starts this trace hidden.
     visible: legendonly
 
-    # Same custom legend behavior for Stage 2 and the automatically-created
-    # right Y axis.
+    # Same persistent legend behavior for Stage 2 and its right-hand axis.
     on_legend_click: |
-      $fn ({vars}) => (event_data) => {
-        const host = vars.find_card?.();
-        if (!host) return true;
+      $fn () => (event_data) => {
+        const host = event_data.node?.getRootNode?.()?.host;
+        if (!host?.config) return true;
 
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
@@ -368,7 +347,7 @@ entities:
         host.config.layout.yaxis2 ??= {};
         host.config.layout.yaxis2.visible = next_visible;
 
-        host.plot({should_fetch: next_visible});
+        host.plot({should_fetch: true});
         return false;
       }
 
@@ -428,6 +407,38 @@ layout:
     # re-evaluated whenever the card replots.
     maxallowed: $ex Date.now()
 
+    # Sticky live edge, without leaving browsing mode:
+    # - historical range => preserve exact range
+    # - right edge at/near now => preserve width but advance the window to now
+    # This is reevaluated on every card replot.
+    range: |
+      $fn ({getFromConfig, vars}) => {
+        const raw = getFromConfig("visible_range");
+        if (!Array.isArray(raw) || raw.length !== 2) return raw;
+
+        const to_ms = (v) => {
+          if (typeof v === "number") return v;
+          if (v instanceof Date) return v.getTime();
+          const ms = new Date(v).getTime();
+          return Number.isFinite(ms) ? ms : NaN;
+        };
+
+        const a = to_ms(raw[0]);
+        const b = to_ms(raw[1]);
+        if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) {
+          return raw;
+        }
+
+        const now = Date.now();
+        const width = b - a;
+
+        if (b >= now - vars.cfg.LIVE_EDGE_TOLERANCE_MS) {
+          return [now - width, now];
+        }
+
+        return [a, b];
+      }
+
     showspikes: true
     spikemode: across
     spikesnap: data
@@ -435,106 +446,92 @@ layout:
     spikethickness: 1
     spikecolor: "#808080"
 
-  # Card-controlled navigation. These buttons use method: skip so Plotly
-  # itself does not perform a relayout; the callbacks update the card's own
-  # browsing/live state and then request a replot.
+  # Navigation uses Plotly's native relayout path only. This keeps the
+  # controls independent of card-instance callback plumbing.
   updatemenus:
     - buttons:
         - label: "◀ ¼"
-          method: skip
-          on_click: |
-            $fn ({vars}) => () => {
-              const host = vars.find_card?.();
-              if (!host) return;
+          method: relayout
+          args:
+            - xaxis.range
+            - |
+              $fn ({getFromConfig}) => {
+                const raw = getFromConfig("visible_range");
+                const fallback_end = Date.now();
+                const fallback_start =
+                  fallback_end - 24 * 60 * 60 * 1000;
+                const r =
+                  Array.isArray(raw) && raw.length === 2
+                    ? raw
+                    : [fallback_start, fallback_end];
 
-              const r = host.getVisibleRange?.();
-              if (!Array.isArray(r) || r.length !== 2) return;
+                const to_ms = (v) => {
+                  if (typeof v === "number") return v;
+                  if (v instanceof Date) return v.getTime();
+                  const ms = new Date(v).getTime();
+                  return Number.isFinite(ms) ? ms : NaN;
+                };
 
-              const a = Number(r[0]);
-              const b = Number(r[1]);
-              const width = b - a;
-              if (!(width > 0)) return;
+                const a = to_ms(r[0]);
+                const b = to_ms(r[1]);
+                if (!Number.isFinite(a) || !Number.isFinite(b)) {
+                  return [fallback_start, fallback_end];
+                }
 
-              const shift = width / 4;
-              const start = a - shift;
-              const end = b - shift;
-
-              host.isBrowsing = true;
-              host.resetButtonEl?.classList.add("hidden");
-              if (host.contentEl?.layout?.xaxis) {
-                host.contentEl.layout.xaxis.range = [
-                  new Date(start).toISOString(),
-                  new Date(end).toISOString()
-                ];
+                const shift = (b - a) / 4;
+                return [a - shift, b - shift];
               }
-              host.plot({should_fetch: true});
-            }
 
         - label: "↻ 24h"
-          method: skip
-          on_click: |
-            $fn ({vars}) => () => {
-              const host = vars.find_card?.();
-              if (!host) return;
-
-              host.config.hours_to_show = 24;
-              host.isBrowsing = false;
-              host.resetButtonEl?.classList.add("hidden");
-              host.configParser?.resetObservedRange?.();
-              host.plot({should_fetch: true});
-            }
+          method: relayout
+          args:
+            - xaxis.range
+            - |
+              $fn () => {
+                const end = Date.now();
+                return [end - 24 * 60 * 60 * 1000, end];
+              }
 
         - label: "¼ ▶"
-          method: skip
-          on_click: |
-            $fn ({vars}) => () => {
-              const host = vars.find_card?.();
-              if (!host) return;
+          method: relayout
+          args:
+            - xaxis.range
+            - |
+              $fn ({getFromConfig}) => {
+                const raw = getFromConfig("visible_range");
+                const fallback_end = Date.now();
+                const fallback_start =
+                  fallback_end - 24 * 60 * 60 * 1000;
+                const r =
+                  Array.isArray(raw) && raw.length === 2
+                    ? raw
+                    : [fallback_start, fallback_end];
 
-              const r = host.getVisibleRange?.();
-              if (!Array.isArray(r) || r.length !== 2) return;
+                const to_ms = (v) => {
+                  if (typeof v === "number") return v;
+                  if (v instanceof Date) return v.getTime();
+                  const ms = new Date(v).getTime();
+                  return Number.isFinite(ms) ? ms : NaN;
+                };
 
-              const a = Number(r[0]);
-              const b = Number(r[1]);
-              const width = b - a;
-              if (!(width > 0)) return;
-
-              const now = Date.now();
-              const shift = width / 4;
-              const new_end = Math.min(now, b + shift);
-
-              if (
-                new_end >= now - vars.cfg.LIVE_EDGE_TOLERANCE_MS
-              ) {
-                // At the right edge: leave browsing, but make the current
-                // zoom width the live hours_to_show. This follows "now"
-                // without resetting to 24 hours.
-                host.config.hours_to_show =
-                  width / (60 * 60 * 1000);
-                host.isBrowsing = false;
-                host.resetButtonEl?.classList.add("hidden");
-                host.configParser?.resetObservedRange?.();
-                host.plot({should_fetch: true});
-              } else {
-                const new_start = new_end - width;
-                host.isBrowsing = true;
-                host.resetButtonEl?.classList.add("hidden");
-                if (host.contentEl?.layout?.xaxis) {
-                  host.contentEl.layout.xaxis.range = [
-                    new Date(new_start).toISOString(),
-                    new Date(new_end).toISOString()
-                  ];
+                const a = to_ms(r[0]);
+                const b = to_ms(r[1]);
+                if (!Number.isFinite(a) || !Number.isFinite(b)) {
+                  return [fallback_start, fallback_end];
                 }
-                host.plot({should_fetch: true});
+
+                const width = b - a;
+                const shift = width / 4;
+                const now = Date.now();
+                const new_end = Math.min(now, b + shift);
+                return [new_end - width, new_end];
               }
-            }
 
       direction: right
       active: -1
       showactive: false
       type: buttons
 
-      # Text-only appearance.
       bgcolor: "rgba(0,0,0,0)"
       bordercolor: "rgba(0,0,0,0)"
       borderwidth: 0
@@ -566,68 +563,6 @@ layout:
       - 0
       - 120
     fixedrange: true
-
-
-# Runtime-only card behavior; no source-file patch required.
-# Plotly Graph Card calls enterBrowsingMode() after every user relayout.
-# Wrap it once so reaching the right edge means "live at this zoom width".
-run_last: |
-  $fn ({vars}) => {
-    const host = vars.find_card?.();
-    if (!host) return null;
-
-    host.resetButtonEl?.classList.add("hidden");
-
-    if (!host.__ac_live_edge_wrapper_installed) {
-      const original_enter = host.enterBrowsingMode.bind(host);
-
-      host.enterBrowsingMode = () => {
-        const r = host.getVisibleRange?.();
-        const now = Date.now();
-
-        if (Array.isArray(r) && r.length === 2) {
-          const a = Number(r[0]);
-          const b = Number(r[1]);
-          const width = b - a;
-
-          const raw_max =
-            host.contentEl?.layout?.xaxis?.maxallowed;
-          const max_allowed =
-            typeof raw_max === "number"
-              ? raw_max
-              : Date.parse(raw_max);
-
-          const at_live_edge =
-            width > 0 &&
-            (
-              b >= now - vars.cfg.LIVE_EDGE_TOLERANCE_MS ||
-              (
-                Number.isFinite(max_allowed) &&
-                b >=
-                  max_allowed - vars.cfg.LIVE_EDGE_TOLERANCE_MS
-              )
-            );
-
-          if (at_live_edge) {
-            host.config.hours_to_show =
-              width / (60 * 60 * 1000);
-            host.isBrowsing = false;
-            host.resetButtonEl?.classList.add("hidden");
-            host.configParser?.resetObservedRange?.();
-            return;
-          }
-        }
-
-        original_enter();
-        // We use our own reset button, so keep the built-in one hidden.
-        host.resetButtonEl?.classList.add("hidden");
-      };
-
-      host.__ac_live_edge_wrapper_installed = true;
-    }
-
-    return null;
-  }
 
 config:
   # Y is fixed, so wheel/drag zooming affects the time axis.
