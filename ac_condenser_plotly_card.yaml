@@ -256,6 +256,29 @@ entities:
     filters:
       - map_y_numbers: Math.max(vars.cfg.Y_MIN_W, Math.min(vars.cfg.Y_MAX_W, y))
 
+
+  # Visible Stage-2 trace. No explicit yaxis assignment and no axis geometry
+  # override; the card auto-groups A separately from W.
+  - entity: sensor.ac_stage2_current
+    name: Stage 2
+    mode: markers
+    extend_to_present: false
+    showlegend: false
+
+    marker:
+      color: "#008b8b"
+      size: 5
+      opacity: 1
+
+    hovertemplate: |
+      <b>Stage 2</b><br>
+      %{x}<br>
+      %{y:.1f} mA
+      <extra></extra>
+
+    filters:
+      - map_y_numbers: y * 1000
+
 layout:
   # In a Panel view, this makes the graph approximately fill the browser
   # viewport vertically as well as horizontally. Adjust 110 if your HA
@@ -266,6 +289,14 @@ layout:
     title:
       text: Power (W)
     range: $ex [vars.cfg.Y_MIN_W, vars.cfg.Y_MAX_W]
+    fixedrange: true
+
+  yaxis2:
+    title:
+      text: Stage 2 (mA)
+    range:
+      - 0
+      - 120
     fixedrange: true
 
 config:
