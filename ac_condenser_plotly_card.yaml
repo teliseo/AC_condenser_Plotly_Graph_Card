@@ -110,11 +110,11 @@ entities:
 
     visible: |
       $fn () => {
-        window.__acCondenserPlotV20State ??= {
+        window.__acCondenserPlotV21State ??= {
           power: true,
           stage2: false
         };
-        return window.__acCondenserPlotV20State.power ? true : "legendonly";
+        return window.__acCondenserPlotV21State.power ? true : "legendonly";
       }
 
     extend_to_present: false
@@ -125,7 +125,7 @@ entities:
     # both trace and axis visibility from that state.
     on_legend_click: |
       $fn () => (event_data) => {
-        window.__acCondenserPlotV20State ??= {
+        window.__acCondenserPlotV21State ??= {
           power: true,
           stage2: false
         };
@@ -133,7 +133,7 @@ entities:
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
           trace?.visible !== false && trace?.visible !== "legendonly";
-        window.__acCondenserPlotV20State.power = !is_visible;
+        window.__acCondenserPlotV21State.power = !is_visible;
 
         return true;
       }
@@ -320,17 +320,17 @@ entities:
     # Stage 2 is off by default, but its state persists across card reparses.
     visible: |
       $fn () => {
-        window.__acCondenserPlotV20State ??= {
+        window.__acCondenserPlotV21State ??= {
           power: true,
           stage2: false
         };
-        return window.__acCondenserPlotV20State.stage2 ? true : "legendonly";
+        return window.__acCondenserPlotV21State.stage2 ? true : "legendonly";
       }
 
     # Same mechanism for Stage 2.
     on_legend_click: |
       $fn () => (event_data) => {
-        window.__acCondenserPlotV20State ??= {
+        window.__acCondenserPlotV21State ??= {
           power: true,
           stage2: false
         };
@@ -338,7 +338,7 @@ entities:
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
           trace?.visible !== false && trace?.visible !== "legendonly";
-        window.__acCondenserPlotV20State.stage2 = !is_visible;
+        window.__acCondenserPlotV21State.stage2 = !is_visible;
 
         return true;
       }
@@ -376,10 +376,104 @@ entities:
       - map_y_numbers: y * 1000
 
 layout:
-  # Force each card reparse to apply the calculated X range. We explicitly
-  # preserve historical ranges below, so changing uirevision is safe here and
-  # is what allows the sticky live edge to advance while still "browsing".
-  uirevision: $ex Date.now()
+  # Runtime-only glue for sticky-live behavior. Browser composedPath() crosses
+  # Home Assistant shadow-root boundaries, so this reliably identifies the
+  # exact plotly-graph card that the user just interacted with.
+  meta: |
+    $fn () => {
+      const KEY = "__acCondenserPlotV21Runtime";
+
+      const is_target_card = (el) => {
+        if (el?.localName !== "plotly-graph") return false;
+        const ents = el.config?.entities ?? [];
+        return (
+          ents.some((e) => e?.entity === "sensor.ac_total_power") &&
+          ents.some((e) => e?.entity === "sensor.ac_stage2_current")
+        );
+      };
+
+      const card_from_event = (event) =>
+        event?.composedPath?.().find(is_target_card);
+
+      const maybe_live = (host) => {
+        if (!is_target_card(host)) return;
+
+        // We use the explicit ↻ 24h Plotly control instead.
+        host.resetButtonEl?.classList.add("hidden");
+
+        const r = host.getVisibleRange?.();
+        if (!Array.isArray(r) || r.length !== 2) return;
+
+        const a = Number(r[0]);
+        const b = Number(r[1]);
+        const width = b - a;
+        if (!(width > 0)) return;
+
+        const now = Date.now();
+
+        const raw_max = host.contentEl?.layout?.xaxis?.maxallowed;
+        const max_allowed =
+          typeof raw_max === "number"
+            ? raw_max
+            : new Date(raw_max).getTime();
+
+        const at_right_edge =
+          b >= now - 5000 ||
+          (
+            Number.isFinite(max_allowed) &&
+            b >= max_allowed - 5000
+          );
+
+        if (!at_right_edge) return;
+
+        // Core strategy:
+        // preserve the current zoom width as "last X", then leave browsing.
+        // The card's ordinary refresh path will now keep this width pinned to
+        // current time as new samples arrive.
+        host.config.hours_to_show = width / (60 * 60 * 1000);
+        host.isBrowsing = false;
+        host.resetButtonEl?.classList.add("hidden");
+        host.configParser?.resetObservedRange?.();
+
+        // Replot once in non-browsing mode so the new last-X range takes
+        // effect immediately instead of waiting for the next HA state update.
+        host.plot({should_fetch: true});
+      };
+
+      if (!window[KEY]) {
+        const schedule = (event, delay = 100) => {
+          const host = card_from_event(event);
+          if (!host) return;
+
+          clearTimeout(host.__acCondenserLiveEdgeTimer);
+          host.__acCondenserLiveEdgeTimer = setTimeout(
+            () => maybe_live(host),
+            delay
+          );
+        };
+
+        const on_pointerup = (event) => schedule(event, 120);
+        const on_touchend = (event) => schedule(event, 150);
+        const on_wheel = (event) => schedule(event, 180);
+
+        window.addEventListener("pointerup", on_pointerup, true);
+        window.addEventListener("touchend", on_touchend, true);
+        window.addEventListener(
+          "wheel",
+          on_wheel,
+          {capture: true, passive: true}
+        );
+
+        window[KEY] = {
+          maybe_live,
+          on_pointerup,
+          on_touchend,
+          on_wheel
+        };
+      }
+
+      return "ac-condenser-v21";
+    }
 
   # In a Panel view, this makes the graph approximately fill the browser
   # viewport vertically as well as horizontally. Adjust 70 if your HA
@@ -404,38 +498,6 @@ layout:
     # re-evaluated whenever the card replots.
     maxallowed: $ex Date.now()
 
-    # Sticky live edge, without leaving browsing mode:
-    # - historical range => preserve exact range
-    # - right edge at/near now => preserve width but advance the window to now
-    # This is reevaluated on every card replot.
-    range: |
-      $fn ({getFromConfig, vars}) => {
-        const raw = getFromConfig("visible_range");
-        if (!Array.isArray(raw) || raw.length !== 2) return raw;
-
-        const to_ms = (v) => {
-          if (typeof v === "number") return v;
-          if (v instanceof Date) return v.getTime();
-          const ms = new Date(v).getTime();
-          return Number.isFinite(ms) ? ms : NaN;
-        };
-
-        const a = to_ms(raw[0]);
-        const b = to_ms(raw[1]);
-        if (!Number.isFinite(a) || !Number.isFinite(b) || b <= a) {
-          return raw;
-        }
-
-        const now = Date.now();
-        const width = b - a;
-
-        if (b >= now - vars.cfg.LIVE_EDGE_TOLERANCE_MS) {
-          return [now - width, now];
-        }
-
-        return [a, b];
-      }
-
     showspikes: true
     spikemode: across
     spikesnap: data
@@ -443,8 +505,9 @@ layout:
     spikethickness: 1
     spikecolor: "#808080"
 
-  # Navigation uses Plotly's native relayout path only. This keeps the
-  # controls independent of card-instance callback plumbing.
+  # Navigation itself uses Plotly's known-good native relayout path.
+  # The runtime listener above observes the completed interaction and, when
+  # its right edge reaches now, converts that range to normal live "last X".
   updatemenus:
     - buttons:
         - label: "◀ ¼"
@@ -548,11 +611,11 @@ layout:
   yaxis:
     visible: |
       $fn () => {
-        window.__acCondenserPlotV20State ??= {
+        window.__acCondenserPlotV21State ??= {
           power: true,
           stage2: false
         };
-        return window.__acCondenserPlotV20State.power;
+        return window.__acCondenserPlotV21State.power;
       }
     title:
       text: Power (W)
@@ -562,11 +625,11 @@ layout:
   yaxis2:
     visible: |
       $fn () => {
-        window.__acCondenserPlotV20State ??= {
+        window.__acCondenserPlotV21State ??= {
           power: true,
           stage2: false
         };
-        return window.__acCondenserPlotV20State.stage2;
+        return window.__acCondenserPlotV21State.stage2;
       }
     title:
       text: Stage 2 (mA)
