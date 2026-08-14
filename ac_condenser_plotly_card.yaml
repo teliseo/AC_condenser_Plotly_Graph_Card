@@ -231,7 +231,7 @@ entities:
           return {
             actual_watts: Number(state),
             stage2_offset_line: Number.isFinite(offset)
-              ? `Stage-2 sample Δt: +${Math.round(offset)} µs<br>`
+              ? `<br>Stage-2 sample Δt: +${Math.round(offset)} µs`
               : ""
           };
         })
@@ -300,8 +300,7 @@ entities:
     hovertemplate: |
       <b>Condenser Power</b><br>
       %{x|%Y-%m-%d %H:%M:%S.%L}<br>
-      %{customdata.actual_watts:.0f} W<br>
-      %{customdata.stage2_offset_line}<extra></extra>
+      %{customdata.actual_watts:.0f} W%{customdata.stage2_offset_line}<extra></extra>
 
     # Clamp only the coordinate plotted on the Y axis.
     # The actual value remains untouched in customdata.actual_watts.
