@@ -29,7 +29,8 @@ hours_to_show: 24h
 
 # Normal (non-browsing) mode follows entity changes automatically.
 # After any manual pan/zoom, Plotly Graph Card deliberately enters browsing
-# mode; use its built-in ↻ control to return to the live 24-hour window.
+# mode and preserves the exact visible X range. Its built-in ↻ control returns
+# to the live 24-hour window.
 refresh_interval: auto
 
 entities:
@@ -49,7 +50,7 @@ entities:
           Y_MIN_W: 1600,
           Y_MAX_W: 3800,
           STAGE2_THRESHOLD_A: 0.07,
-          MATCH_TOLERANCE_MS: 100,
+          MATCH_TOLERANCE_MS: 5,
           NORMAL_COLOR: "#ff9800",
           STAGE2_COLOR: "#006400",
           LINE_COLOR: "#ffe060",
@@ -94,28 +95,6 @@ entities:
     mode: lines+markers
     extend_to_present: false
     cliponaxis: false
-
-    # Keep the native Plotly legend trace toggle, but also synchronize the
-    # corresponding axis visibility. Do not return false: that would suppress
-    # Plotly's normal trace toggle.
-    on_legend_click: |
-      $fn () => (event_data) => {
-        const trace = event_data.data?.[event_data.curveNumber];
-        const currently_visible =
-          trace?.visible !== false && trace?.visible !== "legendonly";
-        const next_visible = !currently_visible;
-
-        const host = event_data.node?.getRootNode?.()?.host;
-        const axis = host?.config?.layout?.yaxis;
-        if (axis) axis.visible = next_visible;
-
-        if (event_data.layout?.yaxis) {
-          event_data.layout.yaxis.visible = next_visible;
-        }
-        if (event_data.fullLayout?.yaxis) {
-          event_data.fullLayout.yaxis.visible = next_visible;
-        }
-      }
 
     # For each power point:
     #   1. Prefer the nearest Stage-2 sample within +/- MATCH_TOLERANCE_MS.
@@ -299,28 +278,6 @@ entities:
     # "legendonly" keeps the legend toggle visible but starts this trace hidden.
     visible: legendonly
 
-    # Synchronize the automatically-generated Stage-2 axis with the native
-    # legend trace toggle. This intentionally changes ONLY axis visibility;
-    # it does not override the card's automatic axis assignment/geometry.
-    on_legend_click: |
-      $fn () => (event_data) => {
-        const trace = event_data.data?.[event_data.curveNumber];
-        const currently_visible =
-          trace?.visible !== false && trace?.visible !== "legendonly";
-        const next_visible = !currently_visible;
-
-        const host = event_data.node?.getRootNode?.()?.host;
-        const axis = host?.config?.layout?.yaxis2;
-        if (axis) axis.visible = next_visible;
-
-        if (event_data.layout?.yaxis2) {
-          event_data.layout.yaxis2.visible = next_visible;
-        }
-        if (event_data.fullLayout?.yaxis2) {
-          event_data.fullLayout.yaxis2.visible = next_visible;
-        }
-      }
-
     marker:
       color: "#008b8b"
 
@@ -355,9 +312,9 @@ entities:
 
 layout:
   # In a Panel view, this makes the graph approximately fill the browser
-  # viewport vertically as well as horizontally. Adjust 95 if your HA
+  # viewport vertically as well as horizontally. Adjust 70 if your HA
   # header/navigation consumes a different amount of vertical space.
-  height: $ex Math.max(100, window.innerHeight - 95)
+  height: $ex Math.max(100, window.innerHeight - 70)
 
   # Keep normal per-point hover labels and draw a thin vertical dashed
   # spikeline through the hovered/nearest data point.
@@ -370,8 +327,6 @@ layout:
     # Put the legend just above the plotting rectangle.
     "y": 1.02
     yanchor: bottom
-    # Axis synchronization is defined for the normal single-click toggle.
-    itemdoubleclick: false
 
   xaxis:
     # Prevent drag/wheel/button panning into the future. This value is
@@ -481,15 +436,12 @@ layout:
         b: 0
 
   yaxis:
-    visible: true
     title:
       text: Power (W)
     range: $ex [vars.cfg.Y_MIN_W, vars.cfg.Y_MAX_W]
     fixedrange: true
 
   yaxis2:
-    # Stage 2 starts legendonly, so its scale starts hidden too.
-    visible: false
     title:
       text: Stage 2 (mA)
     range:
