@@ -29,26 +29,6 @@
 type: custom:plotly-graph
 hours_to_show: 24h
 
-# Custom Plotly buttons. visible_range is reevaluated by Plotly Graph Card,
-# so each click pans by 1/4 of whatever X width is currently visible.
-fn: |
-  $fn ({getFromConfig, vars}) => {
-    const range = getFromConfig("visible_range");
-    const width = range[1] - range[0];
-
-    vars.pan = (label, fraction) => ({
-      args: [
-        "xaxis.range",
-        [
-          range[0] + width * fraction,
-          range[1] + width * fraction
-        ]
-      ],
-      label,
-      method: "relayout"
-    });
-  }
-
 entities:
   # Stage-2 history is used both for coloring the power trace and,
   # optionally, as its own marker-only trace.
@@ -326,8 +306,34 @@ layout:
   updatemenus:
     # Pan left/right by 1/4 of the currently visible X span.
     - buttons:
-        - $fn ({vars}) => vars.pan("←", -0.25)
-        - $fn ({vars}) => vars.pan("→", 0.25)
+        - args:
+            - xaxis.range
+            - |
+              $fn ({getFromConfig}) => {
+                const range = getFromConfig("visible_range");
+                const width = range[1] - range[0];
+                return [
+                  range[0] - width * 0.25,
+                  range[1] - width * 0.25
+                ];
+              }
+          label: "←"
+          method: relayout
+
+        - args:
+            - xaxis.range
+            - |
+              $fn ({getFromConfig}) => {
+                const range = getFromConfig("visible_range");
+                const width = range[1] - range[0];
+                return [
+                  range[0] + width * 0.25,
+                  range[1] + width * 0.25
+                ];
+              }
+          label: "→"
+          method: relayout
+
       direction: right
       active: -1
       showactive: false
