@@ -107,38 +107,35 @@ entities:
     name: Condenser Power
     unit_of_measurement: W
     mode: lines+markers
+
+    visible: |
+      $fn () => {
+        window.__acCondenserPlotV20State ??= {
+          power: true,
+          stage2: false
+        };
+        return window.__acCondenserPlotV20State.power ? true : "legendonly";
+      }
+
     extend_to_present: false
     cliponaxis: false
 
-    # Replace Plotly's native legend restyle with a persistent card-config
-    # update, so trace and axis visibility stay synchronized. The legend event
-    # supplies a DOM node inside this exact card, so no document traversal is
-    # required.
+    # Keep Plotly's known-good native legend toggle. Before it runs, record
+    # the intended state in browser-local state; the next card reparse derives
+    # both trace and axis visibility from that state.
     on_legend_click: |
       $fn () => (event_data) => {
-        const host = event_data.node?.getRootNode?.()?.host;
-        if (!host?.config) return true;
+        window.__acCondenserPlotV20State ??= {
+          power: true,
+          stage2: false
+        };
 
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
           trace?.visible !== false && trace?.visible !== "legendonly";
-        const next_visible = !is_visible;
+        window.__acCondenserPlotV20State.power = !is_visible;
 
-        const cfg_trace = (host.config.entities ?? []).find(
-          (e) =>
-            e?.entity === "sensor.ac_total_power" &&
-            e?.internal !== true
-        );
-        if (cfg_trace) {
-          cfg_trace.visible = next_visible ? true : "legendonly";
-        }
-
-        host.config.layout ??= {};
-        host.config.layout.yaxis ??= {};
-        host.config.layout.yaxis.visible = next_visible;
-
-        host.plot({should_fetch: true});
-        return false;
+        return true;
       }
 
     # For each power point:
@@ -320,35 +317,30 @@ entities:
     extend_to_present: false
     showlegend: true
 
-    # "legendonly" keeps the legend toggle visible but starts this trace hidden.
-    visible: legendonly
+    # Stage 2 is off by default, but its state persists across card reparses.
+    visible: |
+      $fn () => {
+        window.__acCondenserPlotV20State ??= {
+          power: true,
+          stage2: false
+        };
+        return window.__acCondenserPlotV20State.stage2 ? true : "legendonly";
+      }
 
-    # Same persistent legend behavior for Stage 2 and its right-hand axis.
+    # Same mechanism for Stage 2.
     on_legend_click: |
       $fn () => (event_data) => {
-        const host = event_data.node?.getRootNode?.()?.host;
-        if (!host?.config) return true;
+        window.__acCondenserPlotV20State ??= {
+          power: true,
+          stage2: false
+        };
 
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
           trace?.visible !== false && trace?.visible !== "legendonly";
-        const next_visible = !is_visible;
+        window.__acCondenserPlotV20State.stage2 = !is_visible;
 
-        const cfg_trace = (host.config.entities ?? []).find(
-          (e) =>
-            e?.entity === "sensor.ac_stage2_current" &&
-            e?.internal !== true
-        );
-        if (cfg_trace) {
-          cfg_trace.visible = next_visible ? true : "legendonly";
-        }
-
-        host.config.layout ??= {};
-        host.config.layout.yaxis2 ??= {};
-        host.config.layout.yaxis2.visible = next_visible;
-
-        host.plot({should_fetch: true});
-        return false;
+        return true;
       }
 
     marker:
@@ -384,6 +376,11 @@ entities:
       - map_y_numbers: y * 1000
 
 layout:
+  # Force each card reparse to apply the calculated X range. We explicitly
+  # preserve historical ranges below, so changing uirevision is safe here and
+  # is what allows the sticky live edge to advance while still "browsing".
+  uirevision: $ex Date.now()
+
   # In a Panel view, this makes the graph approximately fill the browser
   # viewport vertically as well as horizontally. Adjust 70 if your HA
   # header/navigation consumes a different amount of vertical space.
@@ -549,14 +546,28 @@ layout:
         b: 0
 
   yaxis:
-    visible: true
+    visible: |
+      $fn () => {
+        window.__acCondenserPlotV20State ??= {
+          power: true,
+          stage2: false
+        };
+        return window.__acCondenserPlotV20State.power;
+      }
     title:
       text: Power (W)
     range: $ex [vars.cfg.Y_MIN_W, vars.cfg.Y_MAX_W]
     fixedrange: true
 
   yaxis2:
-    visible: false
+    visible: |
+      $fn () => {
+        window.__acCondenserPlotV20State ??= {
+          power: true,
+          stage2: false
+        };
+        return window.__acCondenserPlotV20State.stage2;
+      }
     title:
       text: Stage 2 (mA)
     range:
