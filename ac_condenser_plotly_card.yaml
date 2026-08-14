@@ -25,7 +25,19 @@
 #   used to color the corresponding power point.
 
 type: custom:plotly-graph
-hours_to_show: 24h
+
+# In live mode this is the current zoom width ("last X hours").
+# Browser-local state makes that width survive every card reparse/reconfigure.
+hours_to_show: |
+  $fn () => {
+    window.__acCondenserPlotV22State ??= {
+      power: window.__acCondenserPlotV22State?.power ?? true,
+      stage2: window.__acCondenserPlotV22State?.stage2 ?? false,
+      live: true,
+      liveHours: 24
+    };
+    return window.__acCondenserPlotV22State.liveHours;
+  }
 
 # Normal (non-browsing) mode follows entity changes automatically.
 # After any manual pan/zoom, Plotly Graph Card deliberately enters browsing
@@ -110,11 +122,13 @@ entities:
 
     visible: |
       $fn () => {
-        window.__acCondenserPlotV21State ??= {
+        window.__acCondenserPlotV22State ??= {
           power: true,
-          stage2: false
+          stage2: false,
+          live: true,
+          liveHours: 24
         };
-        return window.__acCondenserPlotV21State.power ? true : "legendonly";
+        return window.__acCondenserPlotV22State.power ? true : "legendonly";
       }
 
     extend_to_present: false
@@ -125,15 +139,17 @@ entities:
     # both trace and axis visibility from that state.
     on_legend_click: |
       $fn () => (event_data) => {
-        window.__acCondenserPlotV21State ??= {
+        window.__acCondenserPlotV22State ??= {
           power: true,
-          stage2: false
+          stage2: false,
+          live: true,
+          liveHours: 24
         };
 
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
           trace?.visible !== false && trace?.visible !== "legendonly";
-        window.__acCondenserPlotV21State.power = !is_visible;
+        window.__acCondenserPlotV22State.power = !is_visible;
 
         return true;
       }
@@ -320,25 +336,29 @@ entities:
     # Stage 2 is off by default, but its state persists across card reparses.
     visible: |
       $fn () => {
-        window.__acCondenserPlotV21State ??= {
+        window.__acCondenserPlotV22State ??= {
           power: true,
-          stage2: false
+          stage2: false,
+          live: true,
+          liveHours: 24
         };
-        return window.__acCondenserPlotV21State.stage2 ? true : "legendonly";
+        return window.__acCondenserPlotV22State.stage2 ? true : "legendonly";
       }
 
     # Same mechanism for Stage 2.
     on_legend_click: |
       $fn () => (event_data) => {
-        window.__acCondenserPlotV21State ??= {
+        window.__acCondenserPlotV22State ??= {
           power: true,
-          stage2: false
+          stage2: false,
+          live: true,
+          liveHours: 24
         };
 
         const trace = event_data.data?.[event_data.curveNumber];
         const is_visible =
           trace?.visible !== false && trace?.visible !== "legendonly";
-        window.__acCondenserPlotV21State.stage2 = !is_visible;
+        window.__acCondenserPlotV22State.stage2 = !is_visible;
 
         return true;
       }
@@ -376,12 +396,36 @@ entities:
       - map_y_numbers: y * 1000
 
 layout:
-  # Runtime-only glue for sticky-live behavior. Browser composedPath() crosses
-  # Home Assistant shadow-root boundaries, so this reliably identifies the
-  # exact plotly-graph card that the user just interacted with.
+  # Runtime-only glue for sticky-live behavior. No installed JS files are
+  # changed. composedPath() identifies the exact card through HA shadow roots.
   meta: |
     $fn () => {
-      const KEY = "__acCondenserPlotV21Runtime";
+      const STATE_KEY = "__acCondenserPlotV22State";
+      const RUNTIME_KEY = "__acCondenserPlotV22Runtime";
+      const OLD_RUNTIME_KEY = "__acCondenserPlotV21Runtime";
+
+      window[STATE_KEY] ??= {
+        power: window.__acCondenserPlotV22State?.power ?? true,
+        stage2: window.__acCondenserPlotV22State?.stage2 ?? false,
+        live: true,
+        liveHours: 24
+      };
+
+      // Remove v21's global listeners if this YAML is hot-reloaded without a
+      // full browser refresh.
+      const old = window[OLD_RUNTIME_KEY];
+      if (old) {
+        if (old.on_pointerup) {
+          window.removeEventListener("pointerup", old.on_pointerup, true);
+        }
+        if (old.on_touchend) {
+          window.removeEventListener("touchend", old.on_touchend, true);
+        }
+        if (old.on_wheel) {
+          window.removeEventListener("wheel", old.on_wheel, true);
+        }
+        delete window[OLD_RUNTIME_KEY];
+      }
 
       const is_target_card = (el) => {
         if (el?.localName !== "plotly-graph") return false;
@@ -395,11 +439,14 @@ layout:
       const card_from_event = (event) =>
         event?.composedPath?.().find(is_target_card);
 
-      const maybe_live = (host) => {
+      const update_mode = (host) => {
         if (!is_target_card(host)) return;
 
-        // We use the explicit ↻ 24h Plotly control instead.
-        host.resetButtonEl?.classList.add("hidden");
+        // Permanently suppress this card's built-in browsing-reset button.
+        // Our explicit ↻ 24h control is the reset.
+        if (host.resetButtonEl) {
+          host.resetButtonEl.style.display = "none";
+        }
 
         const r = host.getVisibleRange?.();
         if (!Array.isArray(r) || r.length !== 2) return;
@@ -409,6 +456,7 @@ layout:
         const width = b - a;
         if (!(width > 0)) return;
 
+        const state = window[STATE_KEY];
         const now = Date.now();
 
         const raw_max = host.contentEl?.layout?.xaxis?.maxallowed;
@@ -424,37 +472,51 @@ layout:
             b >= max_allowed - 5000
           );
 
-        if (!at_right_edge) return;
+        if (at_right_edge) {
+          const new_live_hours = width / (60 * 60 * 1000);
+          const width_changed =
+            Math.abs((state.liveHours ?? 24) - new_live_hours) > 1e-6;
 
-        // Core strategy:
-        // preserve the current zoom width as "last X", then leave browsing.
-        // The card's ordinary refresh path will now keep this width pinned to
-        // current time as new samples arrive.
-        host.config.hours_to_show = width / (60 * 60 * 1000);
-        host.isBrowsing = false;
-        host.resetButtonEl?.classList.add("hidden");
-        host.configParser?.resetObservedRange?.();
+          state.live = true;
+          state.liveHours = new_live_hours;
 
-        // Replot once in non-browsing mode so the new last-X range takes
-        // effect immediately instead of waiting for the next HA state update.
-        host.plot({should_fetch: true});
+          // Exit browsing, but DO NOT reset to configured 24h. The top-level
+          // hours_to_show function now evaluates to this saved zoom width.
+          host.isBrowsing = false;
+          host.configParser?.resetObservedRange?.();
+
+          // Replot immediately when entering live mode or changing live width.
+          // In normal mode, later HA updates continue advancing "last X".
+          if (width_changed || host.isBrowsing === false) {
+            host.plot({should_fetch: true});
+          }
+          return;
+        }
+
+        // Historical position: keep the card's ordinary fixed browsing range.
+        // Replot only if the mode indicator actually needs to change.
+        const was_live = state.live;
+        state.live = false;
+        if (was_live) {
+          host.plot({should_fetch: false});
+        }
       };
 
-      if (!window[KEY]) {
+      if (!window[RUNTIME_KEY]) {
         const schedule = (event, delay = 100) => {
           const host = card_from_event(event);
           if (!host) return;
 
           clearTimeout(host.__acCondenserLiveEdgeTimer);
           host.__acCondenserLiveEdgeTimer = setTimeout(
-            () => maybe_live(host),
+            () => update_mode(host),
             delay
           );
         };
 
-        const on_pointerup = (event) => schedule(event, 120);
-        const on_touchend = (event) => schedule(event, 150);
-        const on_wheel = (event) => schedule(event, 180);
+        const on_pointerup = (event) => schedule(event, 140);
+        const on_touchend = (event) => schedule(event, 170);
+        const on_wheel = (event) => schedule(event, 220);
 
         window.addEventListener("pointerup", on_pointerup, true);
         window.addEventListener("touchend", on_touchend, true);
@@ -464,15 +526,15 @@ layout:
           {capture: true, passive: true}
         );
 
-        window[KEY] = {
-          maybe_live,
+        window[RUNTIME_KEY] = {
+          update_mode,
           on_pointerup,
           on_touchend,
           on_wheel
         };
       }
 
-      return "ac-condenser-v21";
+      return "ac-condenser-v22";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
@@ -505,10 +567,11 @@ layout:
     spikethickness: 1
     spikecolor: "#808080"
 
-  # Navigation itself uses Plotly's known-good native relayout path.
-  # The runtime listener above observes the completed interaction and, when
-  # its right edge reaches now, converts that range to normal live "last X".
+  # Navigation remains on Plotly's proven native relayout path. The runtime
+  # listener converts a completed right-edge interaction into normal live
+  # "last X" mode at the current zoom width.
   updatemenus:
+    # Back and reset controls.
     - buttons:
         - label: "◀ ¼"
           method: relayout
@@ -552,7 +615,48 @@ layout:
                 return [end - 24 * 60 * 60 * 1000, end];
               }
 
-        - label: "¼ ▶"
+      direction: right
+      active: -1
+      showactive: false
+      type: buttons
+      bgcolor: "rgba(0,0,0,0)"
+      bordercolor: "rgba(0,0,0,0)"
+      borderwidth: 0
+      font:
+        size: 12
+      x: 0.42
+      xanchor: left
+      "y": 1.02
+      yanchor: bottom
+      pad:
+        l: 0
+        r: 0
+        t: 0
+        b: 0
+
+    # Forward control doubles as the live/right-edge indicator.
+    # When live it becomes grey "LIVE ▶" and execute:false makes it inert.
+    - buttons:
+        - label: |
+            $fn () => {
+              window.__acCondenserPlotV22State ??= {
+                power: true,
+                stage2: false,
+                live: true,
+                liveHours: 24
+              };
+              return window.__acCondenserPlotV22State.live ? "LIVE ▶" : "¼ ▶";
+            }
+          execute: |
+            $fn () => {
+              window.__acCondenserPlotV22State ??= {
+                power: true,
+                stage2: false,
+                live: true,
+                liveHours: 24
+              };
+              return !window.__acCondenserPlotV22State.live;
+            }
           method: relayout
           args:
             - xaxis.range
@@ -591,14 +695,24 @@ layout:
       active: -1
       showactive: false
       type: buttons
-
       bgcolor: "rgba(0,0,0,0)"
       bordercolor: "rgba(0,0,0,0)"
       borderwidth: 0
       font:
         size: 12
-
-      x: 0.42
+        color: |
+          $fn ({css_vars}) => {
+            window.__acCondenserPlotV22State ??= {
+              power: true,
+              stage2: false,
+              live: true,
+              liveHours: 24
+            };
+            return window.__acCondenserPlotV22State.live
+              ? css_vars["secondary-text-color"]
+              : css_vars["primary-text-color"];
+          }
+      x: 0.555
       xanchor: left
       "y": 1.02
       yanchor: bottom
@@ -611,11 +725,13 @@ layout:
   yaxis:
     visible: |
       $fn () => {
-        window.__acCondenserPlotV21State ??= {
+        window.__acCondenserPlotV22State ??= {
           power: true,
-          stage2: false
+          stage2: false,
+          live: true,
+          liveHours: 24
         };
-        return window.__acCondenserPlotV21State.power;
+        return window.__acCondenserPlotV22State.power;
       }
     title:
       text: Power (W)
@@ -625,11 +741,13 @@ layout:
   yaxis2:
     visible: |
       $fn () => {
-        window.__acCondenserPlotV21State ??= {
+        window.__acCondenserPlotV22State ??= {
           power: true,
-          stage2: false
+          stage2: false,
+          live: true,
+          liveHours: 24
         };
-        return window.__acCondenserPlotV21State.stage2;
+        return window.__acCondenserPlotV22State.stage2;
       }
     title:
       text: Stage 2 (mA)
