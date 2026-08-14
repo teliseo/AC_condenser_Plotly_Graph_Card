@@ -16,12 +16,13 @@
 #   triangle-up   : values above Y_MAX_W (including compressor start spike)
 #
 # Stage 2:
-#   sensor.ac_stage2_current is fetched but not displayed as its own trace.
-#   For each ac_total_power sample, the nearest Stage-2-current sample within
-#   +/- MATCH_TOLERANCE_MS is treated as a timestamp-paired sample. If none is
-#   that close, the most recent earlier Stage-2 value is still used for color.
-#   Stage-2-active power points use dark green markers. Overflow/underflow
-#   arrows are dark red and larger; all markers are fully opaque.
+#   sensor.ac_stage2_current is fetched once internally for timestamp pairing
+#   and again as an optional visible trace. For each ac_total_power sample, the
+#   nearest Stage-2-current sample within +/- MATCH_TOLERANCE_MS is treated as
+#   timestamp-paired. Those Stage-2 samples are drawn as squares; unpaired
+#   Stage-2 samples are circles. Stage-2 is hidden by default via legendonly.
+#   If no close pair exists, the most recent earlier Stage-2 value is still
+#   used to color the corresponding power point.
 
 type: custom:plotly-graph
 hours_to_show: 24h
@@ -104,6 +105,7 @@ entities:
 
         vars.stage2_at_power = [];
         vars.stage2_match_offset_us = [];
+        vars.stage2_paired_times_us = new Set();
 
         states.forEach((state) => {
           const power_time = vars.to_epoch_us(
@@ -153,6 +155,7 @@ entities:
             // signed timestamp offset in hover text.
             vars.stage2_at_power.push(stage2_values[nearest_index]);
             vars.stage2_match_offset_us.push(nearest_signed_delta);
+            vars.stage2_paired_times_us.add(stage2_times[nearest_index]);
           } else {
             // No near-simultaneous Stage-2 history point. The Stage-2 entity
             // state is persistent, so use the latest earlier state for
@@ -246,7 +249,7 @@ entities:
 
     hovertemplate: |
       <b>Condenser Power</b><br>
-      %{x}<br>
+      %{x|%Y-%m-%d %H:%M:%S.%L}<br>
       %{customdata.actual_watts:.0f} W<br>
       Stage-2 sample Δt: %{customdata.stage2_offset_text}
       <extra></extra>
@@ -266,14 +269,35 @@ entities:
     extend_to_present: false
     showlegend: true
 
+    # "legendonly" keeps the legend toggle visible but starts this trace hidden.
+    visible: legendonly
+
     marker:
       color: "#008b8b"
-      size: 5
+
+      # A Stage-2 history point that was selected as a true +/- tolerance
+      # match for at least one power point is highlighted as a square.
+      symbol: |
+        $fn ({states, vars}) =>
+          states.map((s) => {
+            const t = vars.to_epoch_us(s.last_updated ?? s.last_changed);
+            return vars.stage2_paired_times_us?.has(t)
+              ? "square"
+              : "circle";
+          })
+
+      size: |
+        $fn ({states, vars}) =>
+          states.map((s) => {
+            const t = vars.to_epoch_us(s.last_updated ?? s.last_changed);
+            return vars.stage2_paired_times_us?.has(t) ? 7 : 5;
+          })
+
       opacity: 1
 
     hovertemplate: |
       <b>Stage 2</b><br>
-      %{x}<br>
+      %{x|%Y-%m-%d %H:%M:%S.%L}<br>
       %{y:.1f} mA
       <extra></extra>
 
@@ -285,6 +309,102 @@ layout:
   # viewport vertically as well as horizontally. Adjust 95 if your HA
   # header/navigation consumes a different amount of vertical space.
   height: $ex Math.max(100, window.innerHeight - 95)
+
+  # Keep normal per-point hover labels and draw a thin vertical dashed
+  # spikeline through the hovered/nearest data point.
+  hovermode: closest
+
+  legend:
+    orientation: h
+    x: 0
+    xanchor: left
+    "y": 1
+    yanchor: top
+
+  xaxis:
+    showspikes: true
+    spikemode: across
+    spikesnap: data
+    spikedash: dash
+    spikethickness: 1
+    spikecolor: "#808080"
+
+  # Pan backward/forward by 1/4 of the CURRENT visible X-axis width.
+  # This follows the Plotly Graph Card visible_range/relayout pattern.
+  updatemenus:
+    - buttons:
+        - label: "◀ ¼"
+          method: relayout
+          args:
+            - xaxis.range
+            - |
+              $fn ({getFromConfig}) => {
+                const raw = getFromConfig("visible_range");
+                const fallback_end = Date.now();
+                const fallback_start = fallback_end - 24 * 60 * 60 * 1000;
+                const r =
+                  Array.isArray(raw) && raw.length === 2
+                    ? raw
+                    : [fallback_start, fallback_end];
+
+                const to_ms = (v) => {
+                  if (typeof v === "number") return v;
+                  if (v instanceof Date) return v.getTime();
+                  const ms = new Date(v).getTime();
+                  return Number.isFinite(ms) ? ms : NaN;
+                };
+
+                const a = to_ms(r[0]);
+                const b = to_ms(r[1]);
+                if (!Number.isFinite(a) || !Number.isFinite(b)) {
+                  return [fallback_start, fallback_end];
+                }
+
+                const shift = (b - a) / 4;
+                return [a - shift, b - shift];
+              }
+
+        - label: "¼ ▶"
+          method: relayout
+          args:
+            - xaxis.range
+            - |
+              $fn ({getFromConfig}) => {
+                const raw = getFromConfig("visible_range");
+                const fallback_end = Date.now();
+                const fallback_start = fallback_end - 24 * 60 * 60 * 1000;
+                const r =
+                  Array.isArray(raw) && raw.length === 2
+                    ? raw
+                    : [fallback_start, fallback_end];
+
+                const to_ms = (v) => {
+                  if (typeof v === "number") return v;
+                  if (v instanceof Date) return v.getTime();
+                  const ms = new Date(v).getTime();
+                  return Number.isFinite(ms) ? ms : NaN;
+                };
+
+                const a = to_ms(r[0]);
+                const b = to_ms(r[1]);
+                if (!Number.isFinite(a) || !Number.isFinite(b)) {
+                  return [fallback_start, fallback_end];
+                }
+
+                const shift = (b - a) / 4;
+                return [a + shift, b + shift];
+              }
+
+      direction: right
+      active: -1
+      showactive: false
+      type: buttons
+      x: 0.42
+      xanchor: left
+      "y": 1
+      yanchor: top
+      pad:
+        l: 4
 
   yaxis:
     title:
