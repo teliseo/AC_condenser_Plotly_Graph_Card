@@ -16,9 +16,9 @@
 #   triangle-up   : values above Y_MAX_W (including compressor start spike)
 #
 # Stage 2:
-#   sensor.ac_stage2_current is loaded TWICE:
-#     1) an internal helper copy used only for matching/coloring calculations;
-#     2) a separate hidden-by-default rendered trace for optional display.
+#   sensor.ac_stage2_current is fetched ONCE as an internal helper.
+#   Its optional visible dots are a synthetic trace built from that stored data,
+#   avoiding a second fetch/trace instance of the same HA entity.
 #   For each ac_total_power sample, the nearest Stage-2-current sample within
 #   +/- MATCH_TOLERANCE_MS is treated as a timestamp-paired sample. If none is
 #   that close, the most recent earlier Stage-2 value is still used for color.
@@ -40,7 +40,12 @@ entities:
     # Change these values here; the rest of the card references them.
     # ================================================================
     fn: |
-      $fn ({states, vars}) => {
+      $fn ({states, xs, ys, vars}) => {
+        // Preserve this one fetched Stage-2 history for the optional synthetic
+        // display trace below. No second fetch of sensor.ac_stage2_current.
+        vars.stage2_plot_xs = xs;
+        vars.stage2_plot_ys = ys.map((y) => Number(y));
+
         vars.cfg = {
           Y_MIN_W: 1600,
           Y_MAX_W: 3800,
@@ -87,24 +92,9 @@ entities:
   - entity: sensor.ac_total_power
     name: Condenser Power
     unit_of_measurement: W
-    yaxis: y1
     mode: lines+markers
     extend_to_present: false
     cliponaxis: false
-
-    # Build the plotted power Y values DIRECTLY from this entity's HA history
-    # states. This intentionally bypasses the card's shared/filter `ys` path,
-    # so the optional Stage-2 trace cannot affect power values.
-    "y": |
-      $fn ({states, vars}) =>
-        states.map(({state}) => {
-          const v = Number(state);
-          if (!Number.isFinite(v)) return null;
-          return Math.max(
-            vars.cfg.Y_MIN_W,
-            Math.min(vars.cfg.Y_MAX_W, v)
-          );
-        })
 
     # For each power point:
     #   1. Prefer the nearest Stage-2 sample within +/- MATCH_TOLERANCE_MS.
@@ -268,16 +258,24 @@ entities:
       Stage-2 sample Δt: %{customdata.stage2_offset_text}
       <extra></extra>
 
-  # Optional DISPLAY copy of Stage 2.
-  # The separate internal copy above remains responsible for correlation.
-  - entity: sensor.ac_stage2_current
+    # Clamp only the coordinate plotted on the Y axis.
+    # The actual value remains untouched in customdata.actual_watts.
+    filters:
+      - map_y_numbers: Math.max(vars.cfg.Y_MIN_W, Math.min(vars.cfg.Y_MAX_W, y))
+
+
+  # Optional synthetic DISPLAY trace built from the already-fetched internal
+  # Stage-2 data. This does NOT fetch sensor.ac_stage2_current a second time.
+  - entity: ""
     name: Stage 2
-    unit_of_measurement: mA
+    type: scatter
+    mode: markers
     visible: false
     showlegend: false
-    mode: markers
     yaxis: y2
-    extend_to_present: false
+
+    x: $ex vars.stage2_plot_xs
+    "y": $ex vars.stage2_plot_ys.map((v) => v * 1000)
 
     marker:
       color: "#008b8b"
@@ -289,10 +287,6 @@ entities:
       %{x}<br>
       %{y:.1f} mA
       <extra></extra>
-
-    # Display in mA; the internal matching copy remains in A.
-    filters:
-      - map_y_numbers: y * 1000
 
 layout:
   # In a Panel view, this makes the graph approximately fill the browser
