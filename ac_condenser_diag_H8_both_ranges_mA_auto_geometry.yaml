@@ -1,0 +1,35 @@
+type: custom:plotly-graph
+hours_to_show: 24h
+
+entities:
+  - entity: sensor.ac_total_power
+    name: Total Power
+    mode: lines+markers
+    extend_to_present: false
+
+  - entity: sensor.ac_stage2_current
+    name: Stage 2 Current
+    mode: markers
+    extend_to_present: false
+    filters:
+      - map_y_numbers: y * 1000
+
+layout:
+  height: $ex Math.max(100, window.innerHeight - 95)
+
+  # Keep the card's automatically-generated multi-axis geometry.
+  # Only pin each axis range.
+  yaxis:
+    range:
+      - 1600
+      - 3800
+    fixedrange: true
+
+  yaxis2:
+    range:
+      - 0
+      - 120
+    fixedrange: true
+
+config:
+  scrollZoom: true

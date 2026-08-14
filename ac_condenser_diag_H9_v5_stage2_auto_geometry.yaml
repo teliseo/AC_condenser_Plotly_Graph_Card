@@ -1,0 +1,304 @@
+# Home Assistant Plotly Graph Card
+# A/C condenser power, with clipped display rails and Stage-2 emphasis.
+#
+# Paste this entire file into the card's "Show code editor" in a
+# GUI-managed Home Assistant dashboard.
+#
+# Visible Y range: controlled by Y_MIN_W and Y_MAX_W below.
+# Actual values outside that range are plotted ON the appropriate rail,
+# but hover text reports the original, unclamped value.
+#
+# Marker meanings:
+#   x             : power < 1 W  (power disconnected / anomaly)
+#   square        : 60..80 W     (normal condenser-not-running draw)
+#   triangle-down : other values below Y_MIN_W
+#   circle        : Y_MIN_W..Y_MAX_W
+#   triangle-up   : values above Y_MAX_W (including compressor start spike)
+#
+# Stage 2:
+#   sensor.ac_stage2_current is fetched but not displayed as its own trace.
+#   For each ac_total_power sample, the nearest Stage-2-current sample within
+#   +/- MATCH_TOLERANCE_MS is treated as a timestamp-paired sample. If none is
+#   that close, the most recent earlier Stage-2 value is still used for color.
+#   Stage-2-active power points use dark green markers. Overflow/underflow
+#   arrows are dark red and larger; all markers are fully opaque.
+
+type: custom:plotly-graph
+hours_to_show: 24h
+
+entities:
+  # Historical helper trace only. It is not drawn and does not consume
+  # another visible Y axis.
+  - entity: sensor.ac_stage2_current
+    internal: true
+    extend_to_present: false
+
+    # ================================================================
+    # EASY-TO-CHANGE CONSTANTS
+    # Change these values here; the rest of the card references them.
+    # ================================================================
+    fn: |
+      $fn ({states, vars}) => {
+        vars.cfg = {
+          Y_MIN_W: 1600,
+          Y_MAX_W: 3800,
+          STAGE2_THRESHOLD_A: 0.07,
+          MATCH_TOLERANCE_MS: 100,
+          NORMAL_COLOR: "#ff9800",
+          STAGE2_COLOR: "#006400",
+          LINE_COLOR: "#ffe060",
+          RAIL_COLOR: "#8b0000",
+          MARKER_SIZE_PX: 5,
+          RAIL_MARKER_SIZE_PX: 10
+        };
+
+        // Parse an HA ISO timestamp without losing fractional precision.
+        // Returns integer microseconds since Unix epoch.
+        vars.to_epoch_us = (ts) => {
+          if (!ts) return NaN;
+          const s = String(ts);
+          const m = s.match(
+            /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$/
+          );
+
+          if (!m) {
+            const ms = Date.parse(s);
+            return Number.isFinite(ms) ? Math.round(ms * 1000) : NaN;
+          }
+
+          const whole_seconds_ms = Date.parse(m[1] + m[3]);
+          if (!Number.isFinite(whole_seconds_ms)) return NaN;
+
+          const frac_us = Number((m[2] ?? "").padEnd(6, "0").slice(0, 6));
+          return whole_seconds_ms * 1000 + frac_us;
+        };
+
+        vars.stage2_times_us = states.map((s) =>
+          vars.to_epoch_us(s.last_updated ?? s.last_changed)
+        );
+        vars.stage2_values = states.map((s) => Number(s.state));
+
+        return null;
+      }
+
+
+  - entity: sensor.ac_total_power
+    name: Condenser Power
+    unit_of_measurement: W
+    mode: lines+markers
+    extend_to_present: false
+    cliponaxis: false
+
+    # For each power point:
+    #   1. Prefer the nearest Stage-2 sample within +/- MATCH_TOLERANCE_MS.
+    #   2. Otherwise use the most recent earlier Stage-2 value.
+    # This does NOT alter, resample, add, remove, or move power points.
+    fn: |
+      $fn ({states, vars}) => {
+        const cfg = vars.cfg;
+        const tolerance_us = cfg.MATCH_TOLERANCE_MS * 1000;
+        const stage2_times = vars.stage2_times_us ?? [];
+        const stage2_values = vars.stage2_values ?? [];
+
+        let j = 0;
+
+        vars.stage2_at_power = [];
+        vars.stage2_match_offset_us = [];
+
+        states.forEach((state) => {
+          const power_time = vars.to_epoch_us(
+            state.last_updated ?? state.last_changed
+          );
+
+          // Advance j until it is the first Stage-2 sample AFTER power_time.
+          while (
+            j < stage2_times.length &&
+            stage2_times[j] <= power_time
+          ) {
+            j++;
+          }
+
+          let nearest_index = -1;
+          let nearest_abs_delta = Infinity;
+          let nearest_signed_delta = NaN;
+
+          // Candidate immediately before / at the power timestamp.
+          if (j > 0) {
+            const delta = stage2_times[j - 1] - power_time;
+            if (
+              Number.isFinite(stage2_values[j - 1]) &&
+              Math.abs(delta) < nearest_abs_delta
+            ) {
+              nearest_index = j - 1;
+              nearest_abs_delta = Math.abs(delta);
+              nearest_signed_delta = delta;
+            }
+          }
+
+          // Candidate immediately after the power timestamp.
+          if (j < stage2_times.length) {
+            const delta = stage2_times[j] - power_time;
+            if (
+              Number.isFinite(stage2_values[j]) &&
+              Math.abs(delta) < nearest_abs_delta
+            ) {
+              nearest_index = j;
+              nearest_abs_delta = Math.abs(delta);
+              nearest_signed_delta = delta;
+            }
+          }
+
+          if (nearest_index >= 0 && nearest_abs_delta <= tolerance_us) {
+            // True paired sample: use it for styling and expose its exact
+            // signed timestamp offset in hover text.
+            vars.stage2_at_power.push(stage2_values[nearest_index]);
+            vars.stage2_match_offset_us.push(nearest_signed_delta);
+          } else {
+            // No near-simultaneous Stage-2 history point. The Stage-2 entity
+            // state is persistent, so use the latest earlier state for
+            // coloring, but do NOT report its potentially hours-old timestamp
+            // as though it were a paired sample.
+            const held_index = j > 0 ? j - 1 : -1;
+            vars.stage2_at_power.push(
+              held_index >= 0 ? stage2_values[held_index] : NaN
+            );
+            vars.stage2_match_offset_us.push(NaN);
+          }
+        });
+
+        return null;
+      }
+
+    # Keep the original, unclamped wattage and, only when a true
+    # +/- MATCH_TOLERANCE_MS pair exists, the signed Stage-2 timestamp offset.
+    customdata: |
+      $fn ({states, vars}) =>
+        states.map(({state}, i) => {
+          const offset = vars.stage2_match_offset_us?.[i];
+          return {
+            actual_watts: Number(state),
+            stage2_offset_text: Number.isFinite(offset)
+              ? `${offset >= 0 ? "+" : ""}${Math.round(offset)} µs`
+              : "no paired sample"
+          };
+        })
+
+    line:
+      color: $ex vars.cfg.LINE_COLOR
+      width: 2
+
+    marker:
+      symbol: |
+        $fn ({states, vars}) =>
+          states.map(({state}) => {
+            const v = Number(state);
+            const cfg = vars.cfg;
+
+            if (!Number.isFinite(v)) return "circle-open";
+            if (v < 1) return "x";
+            if (v >= 60 && v <= 80) return "square";
+            if (v < cfg.Y_MIN_W) return "triangle-down";
+            if (v > cfg.Y_MAX_W) return "triangle-up";
+            return "circle";
+          })
+
+      # Overflow/underflow triangles are larger so they remain visibly
+      # triangular at the Y-axis rail. All other markers stay small.
+      size: |
+        $fn ({states, vars}) =>
+          states.map(({state}) => {
+            const v = Number(state);
+            const cfg = vars.cfg;
+            const is_down_arrow =
+              v >= 1 &&
+              !(v >= 60 && v <= 80) &&
+              v < cfg.Y_MIN_W;
+            const is_up_arrow = v > cfg.Y_MAX_W;
+
+            return is_down_arrow || is_up_arrow
+              ? cfg.RAIL_MARKER_SIZE_PX
+              : cfg.MARKER_SIZE_PX;
+          })
+
+      opacity: 1
+
+      # Rail arrows are always dark red. Other markers are dark green when
+      # Stage 2 is active, otherwise orange.
+      color: |
+        $fn ({states, vars}) =>
+          states.map(({state}, i) => {
+            const v = Number(state);
+            const cfg = vars.cfg;
+            const is_down_arrow =
+              v >= 1 &&
+              !(v >= 60 && v <= 80) &&
+              v < cfg.Y_MIN_W;
+            const is_up_arrow = v > cfg.Y_MAX_W;
+
+            if (is_down_arrow || is_up_arrow) {
+              return cfg.RAIL_COLOR;
+            }
+
+            return vars.stage2_at_power?.[i] > cfg.STAGE2_THRESHOLD_A
+              ? cfg.STAGE2_COLOR
+              : cfg.NORMAL_COLOR;
+          })
+
+    hovertemplate: |
+      <b>Condenser Power</b><br>
+      %{x}<br>
+      %{customdata.actual_watts:.0f} W<br>
+      Stage-2 sample Δt: %{customdata.stage2_offset_text}
+      <extra></extra>
+
+    # Clamp only the coordinate plotted on the Y axis.
+    # The actual value remains untouched in customdata.actual_watts.
+    filters:
+      - map_y_numbers: Math.max(vars.cfg.Y_MIN_W, Math.min(vars.cfg.Y_MAX_W, y))
+
+
+  # Visible Stage-2 trace. No explicit yaxis assignment and no axis geometry
+  # override; the card auto-groups A separately from W.
+  - entity: sensor.ac_stage2_current
+    name: Stage 2
+    mode: markers
+    extend_to_present: false
+    showlegend: false
+
+    marker:
+      color: "#008b8b"
+      size: 5
+      opacity: 1
+
+    hovertemplate: |
+      <b>Stage 2</b><br>
+      %{x}<br>
+      %{y:.1f} mA
+      <extra></extra>
+
+    filters:
+      - map_y_numbers: y * 1000
+
+layout:
+  # In a Panel view, this makes the graph approximately fill the browser
+  # viewport vertically as well as horizontally. Adjust 110 if your HA
+  # header/navigation consumes a different amount of vertical space.
+  height: $ex Math.max(100, window.innerHeight - 95)
+
+  yaxis:
+    title:
+      text: Power (W)
+    range: $ex [vars.cfg.Y_MIN_W, vars.cfg.Y_MAX_W]
+    fixedrange: true
+
+  yaxis2:
+    title:
+      text: Stage 2 (mA)
+    range:
+      - 0
+      - 120
+    fixedrange: true
+
+config:
+  # Y is fixed, so wheel/drag zooming affects the time axis.
+  scrollZoom: true
