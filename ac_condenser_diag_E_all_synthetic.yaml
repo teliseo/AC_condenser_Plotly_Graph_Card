@@ -1,0 +1,115 @@
+type: custom:plotly-graph
+raw_plotly_config: true
+hours_to_show: 24h
+
+entities:
+  # Fetch total-power history, but do not let Plotly Graph Card create a trace.
+  - entity: sensor.ac_total_power
+    internal: true
+    fn: |
+      $fn ({xs, ys, states, vars}) => {
+        vars.cfg = vars.cfg ?? {
+          Y_MIN_W: 1600,
+          Y_MAX_W: 3800,
+          STAGE2_THRESHOLD_A: 0.07,
+          MATCH_TOLERANCE_MS: 100,
+          LINE_COLOR: "#ffe060",
+          STAGE2_COLOR: "#006400",
+          RAIL_COLOR: "#8b0000",
+          NORMAL_COLOR: "#ff9800",
+          MARKER_SIZE_PX: 5,
+          RAIL_MARKER_SIZE_PX: 10
+        };
+
+        vars.power_xs = xs;
+        vars.power_ys = ys.map((v) => Number(v));
+        vars.power_states = states;
+        return null;
+      }
+
+  # Fetch Stage-2 history, but do not let Plotly Graph Card create a trace.
+  - entity: sensor.ac_stage2_current
+    internal: true
+    fn: |
+      $fn ({xs, ys, vars}) => {
+        vars.stage2_xs = xs;
+        vars.stage2_ys = ys.map((v) => Number(v));
+        return null;
+      }
+
+  # Synthetic visible POWER trace.
+  - entity: ""
+    name: Condenser Power
+    type: scatter
+    mode: lines+markers
+    yaxis: y
+    x: $ex vars.power_xs
+    "y": |
+      $fn ({vars}) =>
+        vars.power_ys.map((v) => {
+          if (!Number.isFinite(v)) return null;
+          return Math.max(
+            vars.cfg.Y_MIN_W,
+            Math.min(vars.cfg.Y_MAX_W, v)
+          );
+        })
+    line:
+      color: "#ffe060"
+      width: 2
+    marker:
+      color: "#ff9800"
+      size: 5
+      opacity: 1
+    customdata: |
+      $fn ({vars}) =>
+        vars.power_ys.map((v) => ({ actual_watts: v }))
+    hovertemplate: |
+      <b>Condenser Power</b><br>
+      %{x}<br>
+      %{customdata.actual_watts:.0f} W
+      <extra></extra>
+
+  # Synthetic visible STAGE-2 trace.
+  - entity: ""
+    name: Stage 2
+    type: scatter
+    mode: markers
+    yaxis: y2
+    x: $ex vars.stage2_xs
+    "y": $ex vars.stage2_ys.map((v) => v * 1000)
+    marker:
+      color: "#008b8b"
+      size: 5
+      opacity: 1
+    hovertemplate: |
+      <b>Stage 2</b><br>
+      %{x}<br>
+      %{y:.1f} mA
+      <extra></extra>
+
+layout:
+  height: $ex Math.max(100, window.innerHeight - 95)
+
+  yaxis:
+    title:
+      text: Power (W)
+    range:
+      - 1600
+      - 3800
+    fixedrange: true
+
+  yaxis2:
+    title:
+      text: Stage 2 (mA)
+    range:
+      - 0
+      - 120
+    fixedrange: true
+    overlaying: y
+    side: right
+    showgrid: false
+    zeroline: false
+    color: "#008b8b"
+
+config:
+  scrollZoom: true
