@@ -18,8 +18,8 @@
 # Stage 2:
 #   sensor.ac_stage2_current is fetched but not displayed as its own trace.
 #   For each ac_total_power sample, the nearest Stage-2-current sample within
-#   +/- MATCH_TOLERANCE_MS is used. If no Stage-2 sample is that close, the
-#   most recent earlier Stage-2 value is used.
+#   +/- MATCH_TOLERANCE_MS is treated as a timestamp-paired sample. If none is
+#   that close, the most recent earlier Stage-2 value is still used for color.
 #   Stage-2-active power points use dark green markers. Overflow/underflow
 #   arrows are dark red and larger; all markers are fully opaque.
 
@@ -45,7 +45,8 @@ entities:
           STAGE2_THRESHOLD_A: 0.07,
           MATCH_TOLERANCE_MS: 100,
           NORMAL_COLOR: "#ff9800",
-          LINE_COLOR: "#f2b51d",
+          STAGE2_COLOR: "#006400",
+          LINE_COLOR: "#ffe060",
           RAIL_COLOR: "#8b0000",
           MARKER_SIZE_PX: 5,
           RAIL_MARKER_SIZE_PX: 10
@@ -102,7 +103,7 @@ entities:
         let j = 0;
 
         vars.stage2_at_power = [];
-        vars.stage2_offset_us = [];
+        vars.stage2_match_offset_us = [];
 
         states.forEach((state) => {
           const power_time = vars.to_epoch_us(
@@ -117,8 +118,9 @@ entities:
             j++;
           }
 
-          let chosen_index = -1;
+          let nearest_index = -1;
           let nearest_abs_delta = Infinity;
+          let nearest_signed_delta = NaN;
 
           // Candidate immediately before / at the power timestamp.
           if (j > 0) {
@@ -127,8 +129,9 @@ entities:
               Number.isFinite(stage2_values[j - 1]) &&
               Math.abs(delta) < nearest_abs_delta
             ) {
-              chosen_index = j - 1;
+              nearest_index = j - 1;
               nearest_abs_delta = Math.abs(delta);
+              nearest_signed_delta = delta;
             }
           }
 
@@ -139,42 +142,44 @@ entities:
               Number.isFinite(stage2_values[j]) &&
               Math.abs(delta) < nearest_abs_delta
             ) {
-              chosen_index = j;
+              nearest_index = j;
               nearest_abs_delta = Math.abs(delta);
+              nearest_signed_delta = delta;
             }
           }
 
-          // Prefer the nearest sample only when it is within +/- tolerance.
-          // Otherwise fall back to the most recent earlier Stage-2 sample.
-          if (nearest_abs_delta > tolerance_us) {
-            chosen_index = j > 0 ? j - 1 : -1;
-          }
-
-          if (chosen_index >= 0) {
-            vars.stage2_at_power.push(stage2_values[chosen_index]);
-            vars.stage2_offset_us.push(
-              stage2_times[chosen_index] - power_time
-            );
+          if (nearest_index >= 0 && nearest_abs_delta <= tolerance_us) {
+            // True paired sample: use it for styling and expose its exact
+            // signed timestamp offset in hover text.
+            vars.stage2_at_power.push(stage2_values[nearest_index]);
+            vars.stage2_match_offset_us.push(nearest_signed_delta);
           } else {
-            vars.stage2_at_power.push(NaN);
-            vars.stage2_offset_us.push(NaN);
+            // No near-simultaneous Stage-2 history point. The Stage-2 entity
+            // state is persistent, so use the latest earlier state for
+            // coloring, but do NOT report its potentially hours-old timestamp
+            // as though it were a paired sample.
+            const held_index = j > 0 ? j - 1 : -1;
+            vars.stage2_at_power.push(
+              held_index >= 0 ? stage2_values[held_index] : NaN
+            );
+            vars.stage2_match_offset_us.push(NaN);
           }
         });
 
         return null;
       }
 
-    # Keep the original, unclamped wattage and the signed timestamp
-    # offset of the chosen Stage-2 sample for hover display.
+    # Keep the original, unclamped wattage and, only when a true
+    # +/- MATCH_TOLERANCE_MS pair exists, the signed Stage-2 timestamp offset.
     customdata: |
       $fn ({states, vars}) =>
         states.map(({state}, i) => {
-          const offset = vars.stage2_offset_us?.[i];
+          const offset = vars.stage2_match_offset_us?.[i];
           return {
             actual_watts: Number(state),
             stage2_offset_text: Number.isFinite(offset)
               ? `${offset >= 0 ? "+" : ""}${Math.round(offset)} µs`
-              : "n/a"
+              : "no paired sample"
           };
         })
 
