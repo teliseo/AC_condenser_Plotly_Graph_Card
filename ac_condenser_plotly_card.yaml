@@ -27,6 +27,11 @@
 type: custom:plotly-graph
 hours_to_show: 24h
 
+# Normal (non-browsing) mode follows entity changes automatically.
+# After any manual pan/zoom, Plotly Graph Card deliberately enters browsing
+# mode; use its built-in ↻ control to return to the live 24-hour window.
+refresh_interval: auto
+
 entities:
   # Historical helper trace only. It is not drawn and does not consume
   # another visible Y axis.
@@ -89,6 +94,28 @@ entities:
     mode: lines+markers
     extend_to_present: false
     cliponaxis: false
+
+    # Keep the native Plotly legend trace toggle, but also synchronize the
+    # corresponding axis visibility. Do not return false: that would suppress
+    # Plotly's normal trace toggle.
+    on_legend_click: |
+      $fn () => (event_data) => {
+        const trace = event_data.data?.[event_data.curveNumber];
+        const currently_visible =
+          trace?.visible !== false && trace?.visible !== "legendonly";
+        const next_visible = !currently_visible;
+
+        const host = event_data.node?.getRootNode?.()?.host;
+        const axis = host?.config?.layout?.yaxis;
+        if (axis) axis.visible = next_visible;
+
+        if (event_data.layout?.yaxis) {
+          event_data.layout.yaxis.visible = next_visible;
+        }
+        if (event_data.fullLayout?.yaxis) {
+          event_data.fullLayout.yaxis.visible = next_visible;
+        }
+      }
 
     # For each power point:
     #   1. Prefer the nearest Stage-2 sample within +/- MATCH_TOLERANCE_MS.
@@ -272,6 +299,28 @@ entities:
     # "legendonly" keeps the legend toggle visible but starts this trace hidden.
     visible: legendonly
 
+    # Synchronize the automatically-generated Stage-2 axis with the native
+    # legend trace toggle. This intentionally changes ONLY axis visibility;
+    # it does not override the card's automatic axis assignment/geometry.
+    on_legend_click: |
+      $fn () => (event_data) => {
+        const trace = event_data.data?.[event_data.curveNumber];
+        const currently_visible =
+          trace?.visible !== false && trace?.visible !== "legendonly";
+        const next_visible = !currently_visible;
+
+        const host = event_data.node?.getRootNode?.()?.host;
+        const axis = host?.config?.layout?.yaxis2;
+        if (axis) axis.visible = next_visible;
+
+        if (event_data.layout?.yaxis2) {
+          event_data.layout.yaxis2.visible = next_visible;
+        }
+        if (event_data.fullLayout?.yaxis2) {
+          event_data.fullLayout.yaxis2.visible = next_visible;
+        }
+      }
+
     marker:
       color: "#008b8b"
 
@@ -318,10 +367,17 @@ layout:
     orientation: h
     x: 0
     xanchor: left
-    "y": 1
-    yanchor: top
+    # Put the legend just above the plotting rectangle.
+    "y": 1.02
+    yanchor: bottom
+    # Axis synchronization is defined for the normal single-click toggle.
+    itemdoubleclick: false
 
   xaxis:
+    # Prevent drag/wheel/button panning into the future. This value is
+    # re-evaluated whenever the card replots.
+    maxallowed: $ex Date.now()
+
     showspikes: true
     spikemode: across
     spikesnap: data
@@ -391,28 +447,49 @@ layout:
                   return [fallback_start, fallback_end];
                 }
 
-                const shift = (b - a) / 4;
-                return [a + shift, b + shift];
+                const width = b - a;
+                const shift = width / 4;
+                const now = Date.now();
+
+                // Preserve the current window width and clamp its right edge
+                // to the current time.
+                const new_end = Math.min(now, b + shift);
+                return [new_end - width, new_end];
               }
 
       direction: right
       active: -1
       showactive: false
       type: buttons
+
+      # Text-only appearance: no white fill or enclosing border.
+      bgcolor: "rgba(0,0,0,0)"
+      bordercolor: "rgba(0,0,0,0)"
+      borderwidth: 0
+      font:
+        size: 12
+
+      # Share the same row above the graph with the horizontal legend.
       x: 0.42
       xanchor: left
-      "y": 1
-      yanchor: top
+      "y": 1.02
+      yanchor: bottom
       pad:
-        l: 4
+        l: 0
+        r: 0
+        t: 0
+        b: 0
 
   yaxis:
+    visible: true
     title:
       text: Power (W)
     range: $ex [vars.cfg.Y_MIN_W, vars.cfg.Y_MAX_W]
     fixedrange: true
 
   yaxis2:
+    # Stage 2 starts legendonly, so its scale starts hidden too.
+    visible: false
     title:
       text: Stage 2 (mA)
     range:
