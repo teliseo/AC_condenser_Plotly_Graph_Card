@@ -1,7 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v27: trailing-debounced relayout, viewport-sliced cache processing, and
-# reduced duplicate/per-point work for substantially faster browsing.
+# v28: v27 performance architecture plus cached exact-timestamp parsing,
+# lower-allocation viewport extraction, small history prefetch margins, and
+# skipping Stage-2 marker-pair work while the Stage-2 trace is hidden.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -13,6 +14,7 @@
 # Marker meanings:
 #   x             : power < 1 W  (power disconnected / anomaly)
 #   square        : 60..80 W     (normal condenser-not-running draw)
+#   diamond       : 200.. <350 W  (magenta, 7 px)
 #   triangle-down : other values below Y_MIN_W
 #   circle        : Y_MIN_W..Y_MAX_W
 #   triangle-up   : values above Y_MAX_W (including compressor start spike)
@@ -84,15 +86,23 @@ entities:
           LIVE_EDGE_TOLERANCE_MS: 5000,
           NORMAL_COLOR: "#ff9800",
           STAGE2_COLOR: "#006400",
+          MIDRANGE_MIN_W: 200,
+          MIDRANGE_MAX_W: 350,
+          MIDRANGE_COLOR: "#ff00ff",
+          MIDRANGE_MARKER_SIZE_PX: 7,
           LINE_COLOR: "#ffe060",
           RAIL_COLOR: "#8b0000",
           MARKER_SIZE_PX: 5,
           RAIL_MARKER_SIZE_PX: 10
         };
 
-        // Parse an HA ISO timestamp without losing fractional precision.
-        // Returns integer microseconds since Unix epoch.
-        vars.to_epoch_us = (ts) => {
+        // Exact timestamp parsing is relatively expensive (regex + Date.parse).
+        // Cache it by HA state-object identity across replots. Cached history
+        // retains these state objects, and WeakMap does not prevent GC.
+        const timestamp_cache =
+          window.__acCondenserStateTimestampUsCache ??= new WeakMap();
+
+        const parse_epoch_us = (ts) => {
           if (!ts) return NaN;
           const s = String(ts);
           const m = s.match(
@@ -111,10 +121,26 @@ entities:
           return whole_seconds_ms * 1000 + frac_us;
         };
 
-        vars.stage2_times_us = states.map((s) =>
-          vars.to_epoch_us(s.last_updated ?? s.last_changed)
-        );
-        vars.stage2_values = states.map((s) => Number(s.state));
+        vars.state_epoch_us = (state) => {
+          if (!state || typeof state !== "object") return NaN;
+          if (timestamp_cache.has(state)) return timestamp_cache.get(state);
+
+          const result = parse_epoch_us(
+            state.last_updated ?? state.last_changed
+          );
+          timestamp_cache.set(state, result);
+          return result;
+        };
+
+        const n = states.length;
+        vars.stage2_times_us = new Array(n);
+        vars.stage2_values = new Array(n);
+
+        for (let i = 0; i < n; i++) {
+          const state = states[i];
+          vars.stage2_times_us[i] = vars.state_epoch_us(state);
+          vars.stage2_values[i] = Number(state.state);
+        }
 
         return null;
       }
@@ -177,16 +203,27 @@ entities:
 
         let j = 0;
 
-        vars.stage2_paired_times_us = new Set();
-        vars.power_customdata = [];
-        vars.power_symbols = [];
-        vars.power_sizes = [];
-        vars.power_colors = [];
+        window.__acCondenserPlotV22State ??= {
+          power: true,
+          stage2: false,
+          live: true,
+          liveHours: 24
+        };
+        const need_stage2_pair_markers =
+          window.__acCondenserPlotV22State.stage2;
 
-        states.forEach((state) => {
-          const power_time = vars.to_epoch_us(
-            state.last_updated ?? state.last_changed
-          );
+        vars.stage2_paired_times_us =
+          need_stage2_pair_markers ? new Set() : null;
+
+        const n = states.length;
+        vars.power_customdata = new Array(n);
+        vars.power_symbols = new Array(n);
+        vars.power_sizes = new Array(n);
+        vars.power_colors = new Array(n);
+
+        for (let i = 0; i < n; i++) {
+          const state = states[i];
+          const power_time = vars.state_epoch_us(state);
 
           // First Stage-2 sample at or AFTER Total. Anything before Total is
           // categorically not a timestamp pair.
@@ -214,7 +251,9 @@ entities:
 
           if (is_pair) {
             stage2_value = stage2_values[candidate_index];
-            vars.stage2_paired_times_us.add(stage2_times[candidate_index]);
+            if (need_stage2_pair_markers) {
+              vars.stage2_paired_times_us.add(stage2_times[candidate_index]);
+            }
           } else {
             // Held Stage-2 state is only for power-point coloring.
             const held_index = j > 0 ? j - 1 : -1;
@@ -223,9 +262,14 @@ entities:
           }
 
           const v = Number(state.state);
+          const is_idle = v >= 60 && v <= 80;
+          const is_midrange =
+            v >= cfg.MIDRANGE_MIN_W &&
+            v < cfg.MIDRANGE_MAX_W;
           const is_down_arrow =
             v >= 1 &&
-            !(v >= 60 && v <= 80) &&
+            !is_idle &&
+            !is_midrange &&
             v < cfg.Y_MIN_W;
           const is_up_arrow = v > cfg.Y_MAX_W;
           const is_rail = is_down_arrow || is_up_arrow;
@@ -233,30 +277,36 @@ entities:
           let symbol;
           if (!Number.isFinite(v)) symbol = "circle-open";
           else if (v < 1) symbol = "x";
-          else if (v >= 60 && v <= 80) symbol = "square";
+          else if (is_idle) symbol = "square";
+          else if (is_midrange) symbol = "diamond";
           else if (is_down_arrow) symbol = "triangle-down";
           else if (is_up_arrow) symbol = "triangle-up";
           else symbol = "circle";
 
-          vars.power_symbols.push(symbol);
-          vars.power_sizes.push(
-            is_rail ? cfg.RAIL_MARKER_SIZE_PX : cfg.MARKER_SIZE_PX
-          );
-          vars.power_colors.push(
-            is_rail
-              ? cfg.RAIL_COLOR
-              : stage2_value > cfg.STAGE2_THRESHOLD_A
-                ? cfg.STAGE2_COLOR
-                : cfg.NORMAL_COLOR
-          );
+          vars.power_symbols[i] = symbol;
+          vars.power_sizes[i] =
+            is_midrange
+              ? cfg.MIDRANGE_MARKER_SIZE_PX
+              : is_rail
+                ? cfg.RAIL_MARKER_SIZE_PX
+                : cfg.MARKER_SIZE_PX;
 
-          vars.power_customdata.push({
+          vars.power_colors[i] =
+            is_midrange
+              ? cfg.MIDRANGE_COLOR
+              : is_rail
+                ? cfg.RAIL_COLOR
+                : stage2_value > cfg.STAGE2_THRESHOLD_A
+                  ? cfg.STAGE2_COLOR
+                  : cfg.NORMAL_COLOR;
+
+          vars.power_customdata[i] = {
             actual_watts: v,
             stage2_offset_line: is_pair
               ? `<br>Stage-2 sample Δt: +${Math.round(candidate_delta)} µs`
               : ""
-          });
-        });
+          };
+        }
 
         return null;
       }
@@ -330,18 +380,35 @@ entities:
         return true;
       }
 
-    # Build both Stage-2 marker arrays in a single timestamp pass.
+    # Build Stage-2 marker arrays only when the trace is actually visible.
+    # When legend-hidden, scalar marker values avoid a full timestamp pass.
     fn: |
       $fn ({states, vars}) => {
-        vars.stage2_symbols = [];
-        vars.stage2_sizes = [];
+        window.__acCondenserPlotV22State ??= {
+          power: true,
+          stage2: false,
+          live: true,
+          liveHours: 24
+        };
 
-        states.forEach((s) => {
-          const t = vars.to_epoch_us(s.last_updated ?? s.last_changed);
-          const paired = vars.stage2_paired_times_us?.has(t) ?? false;
-          vars.stage2_symbols.push(paired ? "square" : "circle");
-          vars.stage2_sizes.push(paired ? 7 : 5);
-        });
+        if (!window.__acCondenserPlotV22State.stage2) {
+          vars.stage2_symbols = "circle";
+          vars.stage2_sizes = 5;
+          return null;
+        }
+
+        const n = states.length;
+        vars.stage2_symbols = new Array(n);
+        vars.stage2_sizes = new Array(n);
+        const paired_times = vars.stage2_paired_times_us;
+
+        for (let i = 0; i < n; i++) {
+          const paired = paired_times?.has(
+            vars.state_epoch_us(states[i])
+          ) ?? false;
+          vars.stage2_symbols[i] = paired ? "square" : "circle";
+          vars.stage2_sizes[i] = paired ? 7 : 5;
+        }
 
         return null;
       }
@@ -371,9 +438,11 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV27Runtime";
-      const OLD_RUNTIME_KEY = "__acCondenserPlotV24Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV28Runtime";
+      const OLD_RUNTIME_KEY = "__acCondenserPlotV27Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
+      const PREFETCH_FRACTION = 0.25;
+      const PREFETCH_MAX_MS = 60 * 60 * 1000;
 
       window[STATE_KEY] ??= {
         power: true,
@@ -515,15 +584,23 @@ layout:
 
       const patch_cache = (host) => {
         const cache = host.configParser?.cache;
-        if (!cache || cache.__acCondenserV27Patched) return;
+        if (!cache || cache.__acCondenserV28Patched) return;
+
+        // If v27 was hot-loaded in this page, restore its original getData
+        // before replacing it with the v28 implementation.
+        if (cache.__acCondenserV27OriginalGetData) {
+          cache.getData = cache.__acCondenserV27OriginalGetData;
+          delete cache.__acCondenserV27Patched;
+        }
 
         const original_get_data = cache.getData.bind(cache);
-        cache.__acCondenserV27OriginalGetData = original_get_data;
+        const original_fetch = cache.fetch.bind(cache);
+        cache.__acCondenserV28OriginalGetData = original_get_data;
+        cache.__acCondenserV28OriginalFetch = original_fetch;
 
-        // Cache.getData() normally maps the ENTIRE accumulated history into
-        // fresh arrays before the parser trims it. For this card all cached
-        // entities are ordinary HA state entities, so slice the sorted cache
-        // to the current viewport first and only then allocate xs/ys/states.
+        // Avoid constructing arrays for the entire accumulated history. Binary
+        // search the sorted cache and fill only viewport-adjacent rows directly,
+        // avoiding v27's intermediate history.slice() allocation and map passes.
         cache.getData = (entity) => {
           if (
             !entity?.entity ||
@@ -542,8 +619,6 @@ layout:
 
           const [start, end] = range;
 
-          // Also keep one real point on each side when available; the parser's
-          // normal boundary clipping then behaves exactly as before.
           const lower_bound = (target) => {
             let lo = 0;
             let hi = history.length;
@@ -566,35 +641,67 @@ layout:
             return lo;
           };
 
+          // Keep one real point on each side when available. The parser's
+          // normal removeOutOfRange() then preserves its existing edge behavior.
           const first = Math.max(0, lower_bound(start) - 1);
           const last = Math.min(history.length, upper_bound(end) + 1);
-          const rows = history.slice(first, last);
+          const count = Math.max(0, last - first);
 
-          const states = rows.map((row) => row.state);
-          const ys = states.map((state) => {
+          const xs = new Array(count);
+          const ys = new Array(count);
+          const states = new Array(count);
+
+          for (let i = 0; i < count; i++) {
+            const row = history[first + i];
+            const state = row.state;
             const y = state?.state;
-            return y === "unavailable" ||
+
+            xs[i] = row.x;
+            states[i] = state;
+            ys[i] =
+              y === "unavailable" ||
               y === "none" ||
               y === "unknown"
-              ? null
-              : y;
-          });
+                ? null
+                : y;
+          }
 
-          // fetchDataForEntity() calls removeOutOfRange immediately after this.
-          // Set its range to the exact current viewport before that happens.
           if (host.configParser) {
             host.configParser.observed_range = range.slice();
           }
 
           return {
-            xs: rows.map((row) => row.x),
+            xs,
             ys,
             states,
             statistics: []
           };
         };
 
-        cache.__acCondenserV27Patched = true;
+        // Fetch a small margin beyond the requested viewport. This costs little
+        // when zoomed in, is capped at one hour per side, and means nearby
+        // follow-up pans can usually reuse Recorder history already in cache.
+        cache.fetch = (range, entity, hass) => {
+          const normalized = normalize_range(range);
+          if (!normalized) {
+            return original_fetch(range, entity, hass);
+          }
+
+          const [start, end] = normalized;
+          const width = end - start;
+          const margin = Math.min(
+            width * PREFETCH_FRACTION,
+            PREFETCH_MAX_MS
+          );
+
+          return original_fetch(
+            [start - margin, end + margin],
+            entity,
+            hass
+          );
+        };
+
+        cache.__acCondenserV28Patched = true;
       };
 
       const update_button_args = (host, event) => {
@@ -671,14 +778,21 @@ layout:
           delete host.__acCondenserV24RelayoutHandler;
         }
 
-        if (!host.__acCondenserV27StockRelayoutRemoved) {
-          // The card's stock handler immediately launches plot({fetch:true})
-          // for EVERY wheel/drag/button relayout. Remove only that listener.
-          host.contentEl?.off?.("plotly_relayout", host.onRelayout);
-          host.__acCondenserV27StockRelayoutRemoved = true;
+        if (host.__acCondenserV27RelayoutHandler) {
+          host.contentEl?.off?.(
+            "plotly_relayout",
+            host.__acCondenserV27RelayoutHandler
+          );
+          delete host.__acCondenserV27RelayoutHandler;
         }
 
-        if (!host.__acCondenserV27RelayoutHandler) {
+        if (!host.__acCondenserV28StockRelayoutRemoved) {
+          // v27 may already have removed this listener; off() is harmless.
+          host.contentEl?.off?.("plotly_relayout", host.onRelayout);
+          host.__acCondenserV28StockRelayoutRemoved = true;
+        }
+
+        if (!host.__acCondenserV28RelayoutHandler) {
           const handler = (event_data) => {
             if (host.isInternalRelayout) return;
 
@@ -691,7 +805,7 @@ layout:
           };
 
           host.contentEl?.on?.("plotly_relayout", handler);
-          host.__acCondenserV27RelayoutHandler = handler;
+          host.__acCondenserV28RelayoutHandler = handler;
         }
       };
 
@@ -784,7 +898,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v27";
+      return "ac-condenser-v28";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
