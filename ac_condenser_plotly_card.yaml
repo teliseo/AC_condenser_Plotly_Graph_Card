@@ -1,5 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
+# v27: trailing-debounced relayout, viewport-sliced cache processing, and
+# reduced duplicate/per-point work for substantially faster browsing.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -16,8 +18,8 @@
 #   triangle-up   : values above Y_MAX_W (including compressor start spike)
 #
 # Stage 2:
-#   sensor.ac_stage2_current is fetched once internally for timestamp pairing
-#   and again as an optional visible trace. For each ac_total_power sample, the
+#   sensor.ac_stage2_current is fetched internally for timestamp pairing; the
+#   optional visible trace reuses that cached history. For each Total sample, the
 #   first Stage-2-current sample at or AFTER the Total timestamp is treated
 #   as timestamp-paired only if it is within +MATCH_TOLERANCE_MS. A Stage-2
 #   sample before Total is never considered paired. Paired Stage-2 samples
@@ -53,12 +55,13 @@ refresh_interval: auto
 #   0 internal Stage-2 helper
 #   1 condenser power
 #   2 visible Stage-2 trace
-# Forcing all true ensures historical panning always fetches every source,
-# even while Stage 2 is legend-hidden.
+# Internal Stage 2 and Total fetch history. The visible Stage-2 trace reuses
+# the internal Stage-2 cache instead of issuing a duplicate Recorder fetch.
+# This also preserves the workaround for the card's internal-entity mask index.
 fetch_mask:
   - true
   - true
-  - true
+  - false
 
 entities:
   # Historical helper trace only. It is not drawn and does not consume
@@ -75,7 +78,7 @@ entities:
       $fn ({states, vars}) => {
         vars.cfg = {
           Y_MIN_W: 1600,
-          Y_MAX_W: 3800,
+          Y_MAX_W: 4000,
           STAGE2_THRESHOLD_A: 0.07,
           MATCH_TOLERANCE_MS: 5,
           LIVE_EDGE_TOLERANCE_MS: 5000,
@@ -156,11 +159,15 @@ entities:
         return true;
       }
 
-    # For each power point:
+    # One pass over Total points performs pairing AND constructs all of the
+    # customdata/marker arrays. This avoids several additional full-array passes
+    # on every replot.
+    #
+    # Pairing:
     #   1. Pair only with the first Stage-2 sample at/after the Total timestamp,
     #      and only when its offset is 0..+MATCH_TOLERANCE_MS.
     #   2. Otherwise use the most recent earlier Stage-2 value for coloring.
-    # This does NOT alter, resample, add, remove, or move power points.
+    # This does NOT alter, resample, add, remove, or move Total points.
     fn: |
       $fn ({states, vars}) => {
         const cfg = vars.cfg;
@@ -170,17 +177,19 @@ entities:
 
         let j = 0;
 
-        vars.stage2_at_power = [];
-        vars.stage2_match_offset_us = [];
         vars.stage2_paired_times_us = new Set();
+        vars.power_customdata = [];
+        vars.power_symbols = [];
+        vars.power_sizes = [];
+        vars.power_colors = [];
 
         states.forEach((state) => {
           const power_time = vars.to_epoch_us(
             state.last_updated ?? state.last_changed
           );
 
-          // Advance j until it is the first Stage-2 sample at or AFTER
-          // power_time. Anything before Total is categorically not a pair.
+          // First Stage-2 sample at or AFTER Total. Anything before Total is
+          // categorically not a timestamp pair.
           while (
             j < stage2_times.length &&
             stage2_times[j] < power_time
@@ -201,101 +210,75 @@ entities:
             candidate_delta >= 0 &&
             candidate_delta <= tolerance_us;
 
+          let stage2_value;
+
           if (is_pair) {
-            // True paired sample. Its offset is necessarily nonnegative.
-            vars.stage2_at_power.push(stage2_values[candidate_index]);
-            vars.stage2_match_offset_us.push(candidate_delta);
+            stage2_value = stage2_values[candidate_index];
             vars.stage2_paired_times_us.add(stage2_times[candidate_index]);
           } else {
-            // No paired Stage-2 history point. The Stage-2 entity state is
-            // persistent, so use only the latest STRICTLY EARLIER state for
-            // coloring. Never present that held timestamp as a pair.
+            // Held Stage-2 state is only for power-point coloring.
             const held_index = j > 0 ? j - 1 : -1;
-            vars.stage2_at_power.push(
-              held_index >= 0 ? stage2_values[held_index] : NaN
-            );
-            vars.stage2_match_offset_us.push(NaN);
+            stage2_value =
+              held_index >= 0 ? stage2_values[held_index] : NaN;
           }
+
+          const v = Number(state.state);
+          const is_down_arrow =
+            v >= 1 &&
+            !(v >= 60 && v <= 80) &&
+            v < cfg.Y_MIN_W;
+          const is_up_arrow = v > cfg.Y_MAX_W;
+          const is_rail = is_down_arrow || is_up_arrow;
+
+          let symbol;
+          if (!Number.isFinite(v)) symbol = "circle-open";
+          else if (v < 1) symbol = "x";
+          else if (v >= 60 && v <= 80) symbol = "square";
+          else if (is_down_arrow) symbol = "triangle-down";
+          else if (is_up_arrow) symbol = "triangle-up";
+          else symbol = "circle";
+
+          vars.power_symbols.push(symbol);
+          vars.power_sizes.push(
+            is_rail ? cfg.RAIL_MARKER_SIZE_PX : cfg.MARKER_SIZE_PX
+          );
+          vars.power_colors.push(
+            is_rail
+              ? cfg.RAIL_COLOR
+              : stage2_value > cfg.STAGE2_THRESHOLD_A
+                ? cfg.STAGE2_COLOR
+                : cfg.NORMAL_COLOR
+          );
+
+          vars.power_customdata.push({
+            actual_watts: v,
+            stage2_offset_line: is_pair
+              ? `<br>Stage-2 sample Δt: +${Math.round(candidate_delta)} µs`
+              : ""
+          });
         });
 
         return null;
       }
 
-    # Keep the original, unclamped wattage and, only for a true forward
-    # pair, an entire optional Stage-2 hover line. For an unpaired Total point
-    # the string is empty, so there is no "no paired sample" message or label.
-    customdata: |
-      $fn ({states, vars}) =>
-        states.map(({state}, i) => {
-          const offset = vars.stage2_match_offset_us?.[i];
-          return {
-            actual_watts: Number(state),
-            stage2_offset_line: Number.isFinite(offset)
-              ? `<br>Stage-2 sample Δt: +${Math.round(offset)} µs`
-              : ""
-          };
-        })
+    customdata: $ex vars.power_customdata
 
     line:
       color: $ex vars.cfg.LINE_COLOR
       width: 2
 
     marker:
-      symbol: |
-        $fn ({states, vars}) =>
-          states.map(({state}) => {
-            const v = Number(state);
-            const cfg = vars.cfg;
-
-            if (!Number.isFinite(v)) return "circle-open";
-            if (v < 1) return "x";
-            if (v >= 60 && v <= 80) return "square";
-            if (v < cfg.Y_MIN_W) return "triangle-down";
-            if (v > cfg.Y_MAX_W) return "triangle-up";
-            return "circle";
-          })
+      symbol: $ex vars.power_symbols
 
       # Overflow/underflow triangles are larger so they remain visibly
       # triangular at the Y-axis rail. All other markers stay small.
-      size: |
-        $fn ({states, vars}) =>
-          states.map(({state}) => {
-            const v = Number(state);
-            const cfg = vars.cfg;
-            const is_down_arrow =
-              v >= 1 &&
-              !(v >= 60 && v <= 80) &&
-              v < cfg.Y_MIN_W;
-            const is_up_arrow = v > cfg.Y_MAX_W;
-
-            return is_down_arrow || is_up_arrow
-              ? cfg.RAIL_MARKER_SIZE_PX
-              : cfg.MARKER_SIZE_PX;
-          })
+      size: $ex vars.power_sizes
 
       opacity: 1
 
-      # Rail arrows are always dark red. Other markers are dark green when
+      # Rail arrows are dark red. Non-rail points are dark green while
       # Stage 2 is active, otherwise orange.
-      color: |
-        $fn ({states, vars}) =>
-          states.map(({state}, i) => {
-            const v = Number(state);
-            const cfg = vars.cfg;
-            const is_down_arrow =
-              v >= 1 &&
-              !(v >= 60 && v <= 80) &&
-              v < cfg.Y_MIN_W;
-            const is_up_arrow = v > cfg.Y_MAX_W;
-
-            if (is_down_arrow || is_up_arrow) {
-              return cfg.RAIL_COLOR;
-            }
-
-            return vars.stage2_at_power?.[i] > cfg.STAGE2_THRESHOLD_A
-              ? cfg.STAGE2_COLOR
-              : cfg.NORMAL_COLOR;
-          })
+      color: $ex vars.power_colors
 
     hovertemplate: |
       <b>Condenser Power</b><br>
@@ -347,27 +330,26 @@ entities:
         return true;
       }
 
+    # Build both Stage-2 marker arrays in a single timestamp pass.
+    fn: |
+      $fn ({states, vars}) => {
+        vars.stage2_symbols = [];
+        vars.stage2_sizes = [];
+
+        states.forEach((s) => {
+          const t = vars.to_epoch_us(s.last_updated ?? s.last_changed);
+          const paired = vars.stage2_paired_times_us?.has(t) ?? false;
+          vars.stage2_symbols.push(paired ? "square" : "circle");
+          vars.stage2_sizes.push(paired ? 7 : 5);
+        });
+
+        return null;
+      }
+
     marker:
       color: "#008b8b"
-
-      # A Stage-2 history point selected as a true 0..+tolerance forward
-      # match for at least one Total point is highlighted as a square.
-      symbol: |
-        $fn ({states, vars}) =>
-          states.map((s) => {
-            const t = vars.to_epoch_us(s.last_updated ?? s.last_changed);
-            return vars.stage2_paired_times_us?.has(t)
-              ? "square"
-              : "circle";
-          })
-
-      size: |
-        $fn ({states, vars}) =>
-          states.map((s) => {
-            const t = vars.to_epoch_us(s.last_updated ?? s.last_changed);
-            return vars.stage2_paired_times_us?.has(t) ? 7 : 5;
-          })
-
+      symbol: $ex vars.stage2_symbols
+      size: $ex vars.stage2_sizes
       opacity: 1
 
     hovertemplate: |
@@ -380,15 +362,18 @@ entities:
       - map_y_numbers: y * 1000
 
 layout:
-  # Runtime-only glue for sticky-live behavior. No installed JS files are
-  # changed. A capture-phase pointer/wheel listener identifies the exact card
-  # before Plotly handles the interaction, then installs a direct
-  # plotly_relayout listener on that card.
+  # Runtime glue for sticky-live behavior AND interaction performance.
+  #
+  # Plotly itself still pans/zooms immediately. Expensive Recorder fetch /
+  # YAML parse / Plotly.react work waits until INTERACTION_DEBOUNCE_MS after
+  # the last relayout. The stock card's immediate relayout listener is removed
+  # for this card instance only.
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV24Runtime";
-      const OLD_RUNTIME_KEY = "__acCondenserPlotV23Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV27Runtime";
+      const OLD_RUNTIME_KEY = "__acCondenserPlotV24Runtime";
+      const INTERACTION_DEBOUNCE_MS = 225;
 
       window[STATE_KEY] ??= {
         power: true,
@@ -397,17 +382,19 @@ layout:
         liveHours: 24
       };
 
-      // Remove v23's global listeners on a hot reload.
       const old = window[OLD_RUNTIME_KEY];
       if (old) {
-        if (old.on_pointerup) {
-          window.removeEventListener("pointerup", old.on_pointerup, true);
+        if (old.on_pointerdown) {
+          window.removeEventListener("pointerdown", old.on_pointerdown, true);
         }
-        if (old.on_touchend) {
-          window.removeEventListener("touchend", old.on_touchend, true);
+        if (old.on_touchstart) {
+          window.removeEventListener("touchstart", old.on_touchstart, true);
         }
         if (old.on_wheel) {
           window.removeEventListener("wheel", old.on_wheel, true);
+        }
+        if (old.on_pointerup) {
+          window.removeEventListener("pointerup", old.on_pointerup, true);
         }
         delete window[OLD_RUNTIME_KEY];
       }
@@ -431,39 +418,61 @@ layout:
         return Number.isFinite(ms) ? ms : NaN;
       };
 
+      const normalize_range = (raw) => {
+        if (!Array.isArray(raw) || raw.length !== 2) return null;
+        const a = to_ms(raw[0]);
+        const b = to_ms(raw[1]);
+        return Number.isFinite(a) && Number.isFinite(b) && b > a
+          ? [a, b]
+          : null;
+      };
+
       const range_from_relayout = (event_data) => {
         if (Array.isArray(event_data?.["xaxis.range"])) {
-          return event_data["xaxis.range"];
+          return normalize_range(event_data["xaxis.range"]);
         }
 
         if (
           event_data?.["xaxis.range[0]"] !== undefined &&
           event_data?.["xaxis.range[1]"] !== undefined
         ) {
-          return [
+          return normalize_range([
             event_data["xaxis.range[0]"],
             event_data["xaxis.range[1]"]
-          ];
+          ]);
         }
 
         return null;
       };
 
-      const apply_range_mode = (host, raw_range) => {
-        if (!is_target_card(host)) return;
+      const desired_data_range = (host) => {
+        const state = window[STATE_KEY];
 
-        // Our explicit ↻ 24h control replaces the card's reset button.
+        if (state.live) {
+          const end = Date.now();
+          const hours =
+            Number.isFinite(Number(state.liveHours)) &&
+            Number(state.liveHours) > 0
+              ? Number(state.liveHours)
+              : 24;
+          return [end - hours * 60 * 60 * 1000, end];
+        }
+
+        return (
+          normalize_range(host.__acCondenserV27PendingRange) ??
+          normalize_range(host.getVisibleRange?.())
+        );
+      };
+
+      const set_range_mode = (host, range) => {
+        if (!is_target_card(host) || !range) return;
+
         if (host.resetButtonEl) {
           host.resetButtonEl.style.display = "none";
         }
 
-        const a = to_ms(raw_range?.[0]);
-        const b = to_ms(raw_range?.[1]);
+        const [a, b] = range;
         const width = b - a;
-        if (!Number.isFinite(a) || !Number.isFinite(b) || !(width > 0)) {
-          return;
-        }
-
         const state = window[STATE_KEY];
         const now = Date.now();
 
@@ -477,21 +486,171 @@ layout:
             b >= max_allowed - 5000
           );
 
+        host.__acCondenserV27PendingRange = [a, b];
+
         if (at_right_edge) {
           state.live = true;
           state.liveHours = width / (60 * 60 * 1000);
-
-          // The card's own relayout listener has just entered browsing mode.
-          // Overwrite that before its debounced replot runs.  The replot then
-          // evaluates hours_to_show as "last <current zoom width>".
           host.isBrowsing = false;
-          host.configParser?.resetObservedRange?.();
+        } else {
+          state.live = false;
+          host.isBrowsing = true;
+        }
+      };
+
+      const schedule_plot = (host) => {
+        clearTimeout(host.__acCondenserV27RelayoutTimer);
+
+        host.__acCondenserV27RelayoutTimer = setTimeout(() => {
+          const range = desired_data_range(host);
+          if (range && host.configParser) {
+            // Prevent the parser's observed range from growing to encompass
+            // every historical viewport visited during this browsing session.
+            host.configParser.observed_range = range.slice();
+          }
+
+          host.plot({should_fetch: true});
+        }, INTERACTION_DEBOUNCE_MS);
+      };
+
+      const patch_cache = (host) => {
+        const cache = host.configParser?.cache;
+        if (!cache || cache.__acCondenserV27Patched) return;
+
+        const original_get_data = cache.getData.bind(cache);
+        cache.__acCondenserV27OriginalGetData = original_get_data;
+
+        // Cache.getData() normally maps the ENTIRE accumulated history into
+        // fresh arrays before the parser trims it. For this card all cached
+        // entities are ordinary HA state entities, so slice the sorted cache
+        // to the current viewport first and only then allocate xs/ys/states.
+        cache.getData = (entity) => {
+          if (
+            !entity?.entity ||
+            Object.prototype.hasOwnProperty.call(entity, "attribute") ||
+            Object.prototype.hasOwnProperty.call(entity, "statistic")
+          ) {
+            return original_get_data(entity);
+          }
+
+          const history = cache.histories?.[entity.entity] ?? [];
+          const range = desired_data_range(host);
+
+          if (!range || history.length === 0) {
+            return original_get_data(entity);
+          }
+
+          const [start, end] = range;
+
+          // Also keep one real point on each side when available; the parser's
+          // normal boundary clipping then behaves exactly as before.
+          const lower_bound = (target) => {
+            let lo = 0;
+            let hi = history.length;
+            while (lo < hi) {
+              const mid = (lo + hi) >> 1;
+              if (+history[mid].x < target) lo = mid + 1;
+              else hi = mid;
+            }
+            return lo;
+          };
+
+          const upper_bound = (target) => {
+            let lo = 0;
+            let hi = history.length;
+            while (lo < hi) {
+              const mid = (lo + hi) >> 1;
+              if (+history[mid].x <= target) lo = mid + 1;
+              else hi = mid;
+            }
+            return lo;
+          };
+
+          const first = Math.max(0, lower_bound(start) - 1);
+          const last = Math.min(history.length, upper_bound(end) + 1);
+          const rows = history.slice(first, last);
+
+          const states = rows.map((row) => row.state);
+          const ys = states.map((state) => {
+            const y = state?.state;
+            return y === "unavailable" ||
+              y === "none" ||
+              y === "unknown"
+              ? null
+              : y;
+          });
+
+          // fetchDataForEntity() calls removeOutOfRange immediately after this.
+          // Set its range to the exact current viewport before that happens.
+          if (host.configParser) {
+            host.configParser.observed_range = range.slice();
+          }
+
+          return {
+            xs: rows.map((row) => row.x),
+            ys,
+            states,
+            statistics: []
+          };
+        };
+
+        cache.__acCondenserV27Patched = true;
+      };
+
+      const update_button_args = (host, event) => {
+        const button_el = event?.composedPath?.().find((el) => {
+          const raw = el?.className?.baseVal ?? el?.className ?? "";
+          return String(raw).split(/\s+/).includes("updatemenu-button");
+        });
+
+        const button = button_el?.__data__;
+        if (!button) return;
+
+        const label = String(button.label ?? "");
+        const range = normalize_range(host.getVisibleRange?.());
+        if (!range) return;
+
+        const [a, b] = range;
+        const width = b - a;
+        const shift = width / 4;
+        const now = Date.now();
+        const state = window[STATE_KEY];
+
+        if (label === "◀ ¼") {
+          button.execute = true;
+          button.args = ["xaxis.range", [a - shift, b - shift]];
           return;
         }
 
-        // Away from the right edge, leave the card in the browsing mode that
-        // its own relayout handler just selected.
-        state.live = false;
+        if (label === "↻ 24h") {
+          button.execute = true;
+          button.args = [
+            "xaxis.range",
+            [now - 24 * 60 * 60 * 1000, now]
+          ];
+          return;
+        }
+
+        if (label === "¼ ▶") {
+          if (state.live) {
+            // The visual LIVE button will replace this on the next deferred
+            // reparse. Until then, do not allow another forward movement.
+            button.execute = false;
+            return;
+          }
+
+          button.execute = true;
+          const new_end = Math.min(now, b + shift);
+          button.args = [
+            "xaxis.range",
+            [new_end - width, new_end]
+          ];
+          return;
+        }
+
+        if (label === "LIVE ▷") {
+          button.execute = false;
+        }
       };
 
       const ensure_host = (host) => {
@@ -501,36 +660,70 @@ layout:
           host.resetButtonEl.style.display = "none";
         }
 
-        if (!host.__acCondenserV24RelayoutHandler) {
+        patch_cache(host);
+
+        // Remove v24's auxiliary relayout listener if this YAML was hot-loaded.
+        if (host.__acCondenserV24RelayoutHandler) {
+          host.contentEl?.off?.(
+            "plotly_relayout",
+            host.__acCondenserV24RelayoutHandler
+          );
+          delete host.__acCondenserV24RelayoutHandler;
+        }
+
+        if (!host.__acCondenserV27StockRelayoutRemoved) {
+          // The card's stock handler immediately launches plot({fetch:true})
+          // for EVERY wheel/drag/button relayout. Remove only that listener.
+          host.contentEl?.off?.("plotly_relayout", host.onRelayout);
+          host.__acCondenserV27StockRelayoutRemoved = true;
+        }
+
+        if (!host.__acCondenserV27RelayoutHandler) {
           const handler = (event_data) => {
             if (host.isInternalRelayout) return;
 
             const range = range_from_relayout(event_data);
             if (!range) return;
 
-            apply_range_mode(host, range);
+            // Update live/browse state immediately, but defer expensive work.
+            set_range_mode(host, range);
+            schedule_plot(host);
           };
 
           host.contentEl?.on?.("plotly_relayout", handler);
-          host.__acCondenserV24RelayoutHandler = handler;
+          host.__acCondenserV27RelayoutHandler = handler;
         }
       };
 
       if (!window[RUNTIME_KEY]) {
-        // Install the direct Plotly listener BEFORE an interaction can emit
-        // plotly_relayout.  composedPath() crosses HA shadow-root boundaries.
-        const attach_from_event = (event) => {
+        // Capture runs before Plotly's own button/drag/wheel handlers, allowing
+        // us to install the optimized relayout listener before the first
+        // plotly_relayout is emitted.
+        const on_pointerdown = (event) => {
+          const host = card_from_event(event);
+          if (!host) return;
+          ensure_host(host);
+
+          // Native Plotly button args are otherwise frozen at the previous
+          // card parse. Refresh them from the current displayed X range so
+          // rapid repeated quarter-pan clicks accumulate without waiting.
+          update_button_args(host, event);
+        };
+
+        const on_touchstart = (event) => {
+          const host = card_from_event(event);
+          if (!host) return;
+          ensure_host(host);
+          update_button_args(host, event);
+        };
+
+        const on_wheel = (event) => {
           const host = card_from_event(event);
           if (host) ensure_host(host);
         };
 
-        const on_pointerdown = (event) => attach_from_event(event);
-        const on_touchstart = (event) => attach_from_event(event);
-        const on_wheel = (event) => attach_from_event(event);
-
-        // A legend toggle emits plotly_restyle, and the card treats restyle as
-        // browsing.  If we were already live, restore normal/live mode only
-        // after Plotly's delayed single-click legend action has completed.
+        // Preserve the proven v26 legend/live behavior. Legend restyle remains
+        // intentionally outside the relayout debounce because it is infrequent.
         const is_legend_event = (event) =>
           event?.composedPath?.().some((el) => {
             const raw =
@@ -565,7 +758,11 @@ layout:
             if (host.resetButtonEl) {
               host.resetButtonEl.style.display = "none";
             }
-            host.configParser?.resetObservedRange?.();
+
+            const range = desired_data_range(host);
+            if (range && host.configParser) {
+              host.configParser.observed_range = range.slice();
+            }
           }, double_click_delay + 350);
         };
 
@@ -587,7 +784,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v24";
+      return "ac-condenser-v27";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
