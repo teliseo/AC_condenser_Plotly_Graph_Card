@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v38: v37 behavior plus outdoor-temperature history on a hidden fixed
-# 15-120 F third Y axis, with point labels, legend visibility, and a
-# moderately smoothed violet spline.
+# v39: v38 outdoor temperature refined to use source_ts, retain full
+# attribute-only/repeated updates, show condition in hover, interpolate only
+# short unknown blocks, and thin point labels adaptively while favoring extrema.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -100,7 +100,11 @@ entities:
           OUTDOOR_TEMP_MIN_F: 15,
           OUTDOOR_TEMP_MAX_F: 120,
           OUTDOOR_TEMP_COLOR: "#7e57c2",
-          OUTDOOR_TEMP_SMOOTHING: 0.6
+          OUTDOOR_TEMP_SMOOTHING: 0.6,
+          OUTDOOR_TEMP_INTERPOLATE_MAX_HOURS: 3.2,
+          OUTDOOR_TEMP_LABEL_MIN_PX: 18,
+          OUTDOOR_TEMP_MARKER_SIZE_PX: 5,
+          OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX: 4
         };
 
         // Exact timestamp parsing is relatively expensive (regex + Date.parse).
@@ -436,10 +440,14 @@ entities:
       - map_y_numbers: y * 1000
 
 
-  # Outdoor temperature. Its Fahrenheit unit makes Plotly Graph Card assign
-  # it to y3 automatically. y3 is intentionally hidden below: the labels
-  # carry the scale information without adding a third visible axis.
+  # Outdoor temperature. `attribute: source_ts` is intentional even though
+  # the plotted Y value is the entity state. In Plotly Graph Card v3.3.5 an
+  # attribute trace fetches complete HA history rows (attributes included) and
+  # does NOT request minimal_response/no_attributes. This preserves repeated
+  # temperatures and attribute-only updates. The fn below rebuilds X from
+  # source_ts and Y from state.
   - entity: sensor.outdoor_temperature
+    attribute: source_ts
     name: Outdoor Temperature
     unit_of_measurement: "°F"
     mode: lines+markers+text
@@ -447,8 +455,6 @@ entities:
     showlegend: true
     cliponaxis: false
 
-    # Visible by default; native legend click toggles it and the state persists
-    # across the card's reparses/navigation.
     visible: |
       $fn () => {
         window.__acCondenserPlotV22State ??= {
@@ -479,6 +485,276 @@ entities:
         return true;
       }
 
+    fn: |
+      $fn ({states, xs, ys, vars, getFromConfig}) => {
+        const cfg = vars.cfg;
+        const state_store =
+          window.__acCondenserPlotV22State ??= {
+            power: true,
+            stage2: false,
+            live: true,
+            liveHours: 24
+          };
+
+        const to_ms = (v) => {
+          if (typeof v === "number") return v;
+          if (v instanceof Date) return v.getTime();
+          const ms = Date.parse(String(v ?? ""));
+          return Number.isFinite(ms) ? ms : NaN;
+        };
+
+        const is_missing_temp = (v) => {
+          if (v === null || v === undefined) return true;
+          const s = String(v).trim().toLowerCase();
+          return (
+            s === "" ||
+            s === "unknown" ||
+            s === "unavailable" ||
+            s === "none" ||
+            !Number.isFinite(Number(v))
+          );
+        };
+
+        // Rebuild by source_ts. An exact duplicate source_ts collapses to the
+        // latest Recorder row, while equal temperatures at different source_ts
+        // remain separate samples.
+        const by_source_ts = new Map();
+
+        for (let i = 0; i < states.length; i++) {
+          const st = states[i];
+          const t = to_ms(st?.attributes?.source_ts);
+          if (!Number.isFinite(t)) continue;
+
+          const raw = st?.state;
+          const missing = is_missing_temp(raw);
+          const condition_raw = st?.attributes?.condition;
+          const condition =
+            condition_raw === null || condition_raw === undefined
+              ? ""
+              : String(condition_raw);
+
+          by_source_ts.set(t, {
+            t,
+            y: missing ? null : Number(raw),
+            condition,
+            interpolated: false
+          });
+        }
+
+        const rows = Array.from(by_source_ts.values())
+          .sort((a, b) => a.t - b.t);
+
+        // Fill only short, bounded blocks of unknown samples. The furthest
+        // unknown from EACH bracketing valid sample must be <= 3.2 hours.
+        // With roughly hourly reporting this admits at most three consecutive
+        // unknown samples. Interpolation is linear in source time.
+        const max_gap_ms =
+          cfg.OUTDOOR_TEMP_INTERPOLATE_MAX_HOURS * 60 * 60 * 1000;
+
+        let i = 0;
+        while (i < rows.length) {
+          if (rows[i].y !== null) {
+            i++;
+            continue;
+          }
+
+          const block_start = i;
+          while (i < rows.length && rows[i].y === null) i++;
+          const block_end = i - 1;
+          const left_i = block_start - 1;
+          const right_i = i;
+
+          if (
+            left_i < 0 ||
+            right_i >= rows.length ||
+            rows[left_i].y === null ||
+            rows[right_i].y === null
+          ) {
+            continue;
+          }
+
+          const left = rows[left_i];
+          const right = rows[right_i];
+          const furthest_from_left =
+            rows[block_end].t - left.t;
+          const furthest_from_right =
+            right.t - rows[block_start].t;
+
+          if (
+            furthest_from_left > max_gap_ms ||
+            furthest_from_right > max_gap_ms ||
+            right.t <= left.t
+          ) {
+            continue;
+          }
+
+          const dt = right.t - left.t;
+          const dy = right.y - left.y;
+
+          for (let k = block_start; k <= block_end; k++) {
+            const f = (rows[k].t - left.t) / dt;
+            rows[k].y = left.y + f * dy;
+            rows[k].condition = "";
+            rows[k].interpolated = true;
+          }
+        }
+
+        xs.length = rows.length;
+        ys.length = rows.length;
+
+        vars.outdoor_temp_customdata = new Array(rows.length);
+        vars.outdoor_temp_text = new Array(rows.length).fill("");
+        vars.outdoor_temp_marker_sizes = new Array(rows.length);
+
+        for (let j = 0; j < rows.length; j++) {
+          const row = rows[j];
+          xs[j] = new Date(row.t);
+          ys[j] = row.y;
+
+          const rounded =
+            row.y === null ? null : Math.round(row.y);
+
+          let hover = "";
+          if (rounded !== null) {
+            if (row.interpolated) {
+              hover = `~${rounded} °F`;
+            } else {
+              hover = `${rounded} °F`;
+              if (
+                row.condition &&
+                row.condition.toLowerCase() !== "unavailable"
+              ) {
+                hover += ` · ${row.condition}`;
+              }
+            }
+          }
+
+          vars.outdoor_temp_customdata[j] = {
+            hover,
+            interpolated: row.interpolated
+          };
+
+          vars.outdoor_temp_marker_sizes[j] =
+            row.interpolated
+              ? cfg.OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX
+              : cfg.OUTDOOR_TEMP_MARKER_SIZE_PX;
+        }
+
+        // Scatter text has no built-in collision avoidance. Estimate horizontal
+        // pixel positions from the visible time range and plotting width, then
+        // greedily keep labels separated by >= 18 px. Extrema are selected
+        // first, then endpoints/actual samples, then interpolated samples.
+        const visible = getFromConfig("visible_range");
+        let x0 = to_ms(visible?.[0]);
+        let x1 = to_ms(visible?.[1]);
+
+        if (
+          !Number.isFinite(x0) ||
+          !Number.isFinite(x1) ||
+          x1 <= x0
+        ) {
+          const finite_rows = rows.filter((r) => r.y !== null);
+          if (finite_rows.length) {
+            x0 = finite_rows[0].t;
+            x1 = finite_rows[finite_rows.length - 1].t;
+          }
+        }
+
+        const plot_width =
+          Number.isFinite(Number(state_store.plotWidthPx)) &&
+          Number(state_store.plotWidthPx) > 0
+            ? Number(state_store.plotWidthPx)
+            : Math.max(250, window.innerWidth - 120);
+
+        const min_label_px = cfg.OUTDOOR_TEMP_LABEL_MIN_PX;
+        const span = x1 - x0;
+        const px_at = (t) =>
+          Number.isFinite(span) && span > 0
+            ? ((t - x0) / span) * plot_width
+            : 0;
+
+        const candidates = [];
+
+        for (let j = 0; j < rows.length; j++) {
+          const row = rows[j];
+          if (row.y === null) continue;
+
+          let is_extremum = false;
+          if (
+            j > 0 &&
+            j + 1 < rows.length &&
+            rows[j - 1].y !== null &&
+            rows[j + 1].y !== null
+          ) {
+            const yp = rows[j - 1].y;
+            const yc = row.y;
+            const yn = rows[j + 1].y;
+
+            is_extremum =
+              (
+                yc <= yp &&
+                yc <= yn &&
+                (yc < yp || yc < yn)
+              ) ||
+              (
+                yc >= yp &&
+                yc >= yn &&
+                (yc > yp || yc > yn)
+              );
+          }
+
+          const is_endpoint =
+            j === 0 ||
+            j === rows.length - 1;
+
+          let priority = 1;
+          if (!row.interpolated) priority += 1;
+          if (is_endpoint) priority += 1;
+          if (is_extremum) priority += 4;
+
+          candidates.push({
+            i: j,
+            px: px_at(row.t),
+            priority
+          });
+        }
+
+        candidates.sort(
+          (a, b) =>
+            b.priority - a.priority ||
+            a.i - b.i
+        );
+
+        const chosen = [];
+
+        for (const candidate of candidates) {
+          let too_close = false;
+
+          for (const accepted of chosen) {
+            if (
+              Math.abs(candidate.px - accepted.px) <
+              min_label_px
+            ) {
+              too_close = true;
+              break;
+            }
+          }
+
+          if (!too_close) chosen.push(candidate);
+        }
+
+        for (const candidate of chosen) {
+          const row = rows[candidate.i];
+          const rounded = Math.round(row.y);
+          vars.outdoor_temp_text[candidate.i] =
+            row.interpolated
+              ? `~${rounded}°`
+              : `${rounded}°`;
+        }
+
+        return null;
+      }
+
     line:
       color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
       width: 2
@@ -487,20 +763,22 @@ entities:
 
     marker:
       color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
-      size: 5
+      size: $ex vars.outdoor_temp_marker_sizes
       symbol: circle
 
-    # One compact label at each actual HA weather-derived update.
-    texttemplate: "%{y:.0f}°"
+    text: $ex vars.outdoor_temp_text
+    texttemplate: "%{text}"
     textposition: top center
     textfont:
       color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
       size: 10
 
+    customdata: $ex vars.outdoor_temp_customdata
+
     hovertemplate: |
       <b>Outdoor Temperature</b><br>
       %{x|%Y-%m-%d %H:%M:%S}<br>
-      %{y:.1f} °F
+      %{customdata.hover}
       <extra></extra>
 
 layout:
@@ -513,7 +791,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV38Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV39Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -679,6 +957,30 @@ layout:
           stale_v38.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV38Runtime;
+      }
+
+      // Clean an earlier v39 runtime if this YAML is hot-reloaded.
+      const stale_v39 = window.__acCondenserPlotV39Runtime;
+      if (stale_v39) {
+        if (stale_v39.on_click) {
+          window.removeEventListener("click", stale_v39.on_click, true);
+        }
+        if (stale_v39.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v39.on_pointerdown, true);
+        }
+        if (stale_v39.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v39.on_touchstart, true);
+        }
+        if (stale_v39.on_wheel) {
+          window.removeEventListener("wheel", stale_v39.on_wheel, true);
+        }
+        if (stale_v39.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v39.on_pointerup, true);
+        }
+        if (stale_v39.initialize_timer_ids) {
+          stale_v39.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV39Runtime;
       }
 
       const is_target_card = (el) => {
@@ -1086,6 +1388,20 @@ layout:
       const ensure_host = (host) => {
         if (!is_target_card(host)) return;
 
+        const state = window[STATE_KEY];
+        const actual_plot_width =
+          Number(host.contentEl?._fullLayout?._size?.w);
+        if (Number.isFinite(actual_plot_width) && actual_plot_width > 0) {
+          state.plotWidthPx = actual_plot_width;
+        } else {
+          const fallback_width =
+            Number(host.contentEl?.clientWidth) ||
+            Number(host.clientWidth);
+          if (Number.isFinite(fallback_width) && fallback_width > 0) {
+            state.plotWidthPx = Math.max(250, fallback_width - 100);
+          }
+        }
+
         install_modebar_style(host);
 
         if (!host.__acCondenserV35ModebarObserver && host.contentEl) {
@@ -1352,7 +1668,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v38";
+      return "ac-condenser-v39";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
