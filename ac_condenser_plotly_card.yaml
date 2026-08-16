@@ -1,8 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v39: v38 outdoor temperature refined to use source_ts, retain full
-# attribute-only/repeated updates, show condition in hover, interpolate only
-# short unknown blocks, and thin point labels adaptively while favoring extrema.
+# v40: v39 behavior with correct Shelly/weather source_ts parsing. source_ts
+# is a fractional Unix timestamp in seconds, not an ISO date string.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -497,8 +496,30 @@ entities:
           };
 
         const to_ms = (v) => {
-          if (typeof v === "number") return v;
           if (v instanceof Date) return v.getTime();
+
+          // source_ts is normally a Unix epoch timestamp in seconds, e.g.
+          // 1786919482.341296. Also accept millisecond epochs and numeric
+          // strings defensively.
+          const numeric =
+            typeof v === "number"
+              ? v
+              : (
+                  typeof v === "string" &&
+                  v.trim() !== "" &&
+                  Number.isFinite(Number(v))
+                )
+                ? Number(v)
+                : NaN;
+
+          if (Number.isFinite(numeric)) {
+            // Contemporary Unix seconds are ~1e9; epoch milliseconds are ~1e12.
+            return Math.abs(numeric) < 1e11
+              ? numeric * 1000
+              : numeric;
+          }
+
+          // Fallback for any future ISO-style source timestamp.
           const ms = Date.parse(String(v ?? ""));
           return Number.isFinite(ms) ? ms : NaN;
         };
@@ -791,7 +812,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV39Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV40Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -981,6 +1002,30 @@ layout:
           stale_v39.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV39Runtime;
+      }
+
+      // Clean an earlier v40 runtime if this YAML is hot-reloaded.
+      const stale_v40 = window.__acCondenserPlotV40Runtime;
+      if (stale_v40) {
+        if (stale_v40.on_click) {
+          window.removeEventListener("click", stale_v40.on_click, true);
+        }
+        if (stale_v40.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v40.on_pointerdown, true);
+        }
+        if (stale_v40.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v40.on_touchstart, true);
+        }
+        if (stale_v40.on_wheel) {
+          window.removeEventListener("wheel", stale_v40.on_wheel, true);
+        }
+        if (stale_v40.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v40.on_pointerup, true);
+        }
+        if (stale_v40.initialize_timer_ids) {
+          stale_v40.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV40Runtime;
       }
 
       const is_target_card = (el) => {
@@ -1668,7 +1713,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v39";
+      return "ac-condenser-v40";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
