@@ -1,7 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v31: v30 behavior with an explicit modebar policy: keep PNG export, remove
-# incompatible/reset/selection controls, and add spike-line plus hover-mode controls.
+# v32: v31 behavior plus X-only spike-line toggling. Plotly's built-in
+# toggleSpikelines affects every Cartesian axis; runtime normalization keeps
+# the desired vertical X-axis spike while forcing Y-axis spikes off.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -795,6 +796,40 @@ layout:
           const handler = (event_data) => {
             if (host.isInternalRelayout) return;
 
+            // Plotly's built-in Toggle Spike Lines changes showspikes on every
+            // Cartesian axis. This card intentionally uses only the X-axis
+            // spike (a vertical cursor line), so normalize any spike-toggle
+            // relayout back to X-only without starting an expensive history
+            // fetch/reparse.
+            const spike_event =
+              event_data?.["xaxis.showspikes"] !== undefined ||
+              event_data?.["yaxis.showspikes"] !== undefined ||
+              event_data?.["yaxis2.showspikes"] !== undefined;
+
+            if (spike_event) {
+              const x_show =
+                event_data?.["xaxis.showspikes"] !== undefined
+                  ? Boolean(event_data["xaxis.showspikes"])
+                  : Boolean(host.contentEl?.layout?.xaxis?.showspikes);
+
+              const y1_show = Boolean(host.contentEl?.layout?.yaxis?.showspikes);
+              const y2_show = Boolean(host.contentEl?.layout?.yaxis2?.showspikes);
+
+              if (y1_show || y2_show) {
+                host.isInternalRelayout++;
+                Promise.resolve(
+                  window.Plotly?.relayout?.(host.contentEl, {
+                    "xaxis.showspikes": x_show,
+                    "yaxis.showspikes": false,
+                    "yaxis2.showspikes": false
+                  })
+                ).finally(() => {
+                  host.isInternalRelayout--;
+                });
+              }
+              return;
+            }
+
             const range = range_from_relayout(event_data);
             if (!range) return;
 
@@ -1060,6 +1095,7 @@ layout:
         b: 0
 
   yaxis:
+    showspikes: false
     visible: |
       $fn () => {
         window.__acCondenserPlotV22State ??= {
@@ -1076,6 +1112,7 @@ layout:
     fixedrange: true
 
   yaxis2:
+    showspikes: false
     visible: |
       $fn () => {
         window.__acCondenserPlotV22State ??= {
