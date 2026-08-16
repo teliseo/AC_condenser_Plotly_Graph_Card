@@ -1,7 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v36: v35 behavior plus persistent hover mode. 24h/reset navigation preserves
-# Closest vs Compare hover selection while leaving spike state unchanged.
+# v37: v36 behavior plus explicit persistent drag mode. The 24h button
+# resets dragmode to Pan while preserving hover mode and spike-line state.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -437,7 +437,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV36Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV37Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -555,6 +555,30 @@ layout:
           stale_v36.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV36Runtime;
+      }
+
+      // Clean an earlier v37 runtime if this YAML is hot-reloaded.
+      const stale_v37 = window.__acCondenserPlotV37Runtime;
+      if (stale_v37) {
+        if (stale_v37.on_click) {
+          window.removeEventListener("click", stale_v37.on_click, true);
+        }
+        if (stale_v37.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v37.on_pointerdown, true);
+        }
+        if (stale_v37.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v37.on_touchstart, true);
+        }
+        if (stale_v37.on_wheel) {
+          window.removeEventListener("wheel", stale_v37.on_wheel, true);
+        }
+        if (stale_v37.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v37.on_pointerup, true);
+        }
+        if (stale_v37.initialize_timer_ids) {
+          stale_v37.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV37Runtime;
       }
 
       const is_target_card = (el) => {
@@ -820,10 +844,10 @@ layout:
 
         if (label === "↻ 24h") {
           button.execute = true;
-          button.args = [
-            "xaxis.range",
-            [now - 24 * 60 * 60 * 1000, now]
-          ];
+          button.args = [{
+            "xaxis.range": [now - 24 * 60 * 60 * 1000, now],
+            dragmode: "pan"
+          }];
           return;
         }
 
@@ -1019,6 +1043,14 @@ layout:
               requested_hovermode === "y"
             ) {
               window[STATE_KEY].hovermode = requested_hovermode;
+            }
+
+            const requested_dragmode = event_data?.dragmode;
+            if (
+              requested_dragmode === "zoom" ||
+              requested_dragmode === "pan"
+            ) {
+              window[STATE_KEY].dragmode = requested_dragmode;
             }
 
             // Relayout is also emitted for dragmode/hovermode changes.
@@ -1220,13 +1252,26 @@ layout:
         };
       }
 
-      return "ac-condenser-v36";
+      return "ac-condenser-v37";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
   # viewport vertically as well as horizontally. Adjust 70 if your HA
   # header/navigation consumes a different amount of vertical space.
   height: $ex Math.max(100, window.innerHeight - 70)
+
+  # Preserve Zoom/Pan across ordinary reparses. The 24h button explicitly
+  # writes dragmode: pan, so that navigation action also becomes persistent.
+  dragmode: |
+    $fn () => {
+      window.__acCondenserPlotV22State ??= {
+        power: true,
+        stage2: false,
+        live: true,
+        liveHours: 24
+      };
+      return window.__acCondenserPlotV22State.dragmode ?? "pan";
+    }
 
   # Preserve the user's Closest vs Compare choice across 24h/reset reparses.
   # Default remains normal per-point closest hover.
@@ -1311,11 +1356,16 @@ layout:
         - label: "↻ 24h"
           method: relayout
           args:
-            - xaxis.range
             - |
               $fn () => {
                 const end = Date.now();
-                return [end - 24 * 60 * 60 * 1000, end];
+                return {
+                  "xaxis.range": [
+                    end - 24 * 60 * 60 * 1000,
+                    end
+                  ],
+                  dragmode: "pan"
+                };
               }
 
         # Historical forward control. Hidden while live.
