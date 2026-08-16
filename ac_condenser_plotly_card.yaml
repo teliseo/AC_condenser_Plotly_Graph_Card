@@ -1,8 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v33: v31 behavior with a true X-only spike toggle. The built-in Plotly
-# spike-button click is intercepted before Plotly handles it; persistent card
-# state drives xaxis.showspikes while both Y-axis spikes remain disabled.
+# v34: v33 behavior plus explicit, high-contrast modebar active-state
+# indication for Spike Lines, Closest/Compare hover, and Zoom/Pan modes.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -438,7 +437,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV33Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV34Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -468,7 +467,7 @@ layout:
         delete window[OLD_RUNTIME_KEY];
       }
 
-      // Clean an earlier v33 runtime if this YAML is hot-reloaded.
+      // Clean v33 runtime if this YAML is hot-loaded over it.
       const stale_v33 = window.__acCondenserPlotV33Runtime;
       if (stale_v33) {
         if (stale_v33.on_click) {
@@ -487,6 +486,27 @@ layout:
           window.removeEventListener("pointerup", stale_v33.on_pointerup, true);
         }
         delete window.__acCondenserPlotV33Runtime;
+      }
+
+      // Clean an earlier v34 runtime if this YAML is hot-reloaded.
+      const stale_v34 = window.__acCondenserPlotV34Runtime;
+      if (stale_v34) {
+        if (stale_v34.on_click) {
+          window.removeEventListener("click", stale_v34.on_click, true);
+        }
+        if (stale_v34.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v34.on_pointerdown, true);
+        }
+        if (stale_v34.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v34.on_touchstart, true);
+        }
+        if (stale_v34.on_wheel) {
+          window.removeEventListener("wheel", stale_v34.on_wheel, true);
+        }
+        if (stale_v34.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v34.on_pointerup, true);
+        }
+        delete window.__acCondenserPlotV34Runtime;
       }
 
       const is_target_card = (el) => {
@@ -781,6 +801,51 @@ layout:
         }
       };
 
+      const sync_modebar_active = (host) => {
+        if (!is_target_card(host)) return;
+
+        const modebar = host.contentEl?.querySelector?.(".modebar");
+        if (!modebar) return;
+
+        const full = host.contentEl?._fullLayout ?? {};
+        const state = window[STATE_KEY];
+        const dragmode = full.dragmode ?? host.contentEl?.layout?.dragmode ?? "zoom";
+        const hovermode = full.hovermode ?? host.contentEl?.layout?.hovermode ?? "closest";
+        const spikes = state.spikes ?? true;
+
+        const inactive =
+          full.modebar?.color ??
+          getComputedStyle(host.contentEl).getPropertyValue("--secondary-text-color") ??
+          "rgba(127,127,127,.5)";
+        const active =
+          full.modebar?.activecolor ??
+          getComputedStyle(host.contentEl).getPropertyValue("--primary-color") ??
+          "rgba(0,127,255,1)";
+
+        const states_by_title = {
+          "Zoom": dragmode === "zoom",
+          "Pan": dragmode === "pan",
+          "Show closest data on hover": hovermode === "closest",
+          "Compare data on hover": hovermode === "x" || hovermode === "y",
+          "Toggle Spike Lines": spikes
+        };
+
+        modebar.querySelectorAll(".modebar-btn").forEach((button) => {
+          const title =
+            button.getAttribute("data-title") ??
+            button.getAttribute("aria-label");
+          if (!(title in states_by_title)) return;
+
+          const is_active = Boolean(states_by_title[title]);
+          button.classList.toggle("active", is_active);
+
+          const path = button.querySelector(".icon path");
+          if (path && !button.matches(":hover")) {
+            path.style.fill = is_active ? active : inactive;
+          }
+        });
+      };
+
       const ensure_host = (host) => {
         if (!is_target_card(host)) return;
 
@@ -817,6 +882,9 @@ layout:
           const handler = (event_data) => {
             if (host.isInternalRelayout) return;
 
+            // Relayout is also emitted for dragmode/hovermode changes.
+            setTimeout(() => sync_modebar_active(host), 0);
+
             const range = range_from_relayout(event_data);
             if (!range) return;
 
@@ -828,6 +896,10 @@ layout:
           host.contentEl?.on?.("plotly_relayout", handler);
           host.__acCondenserV28RelayoutHandler = handler;
         }
+
+        // Modebar may be rebuilt by Plotly.react(); synchronize after the
+        // current JS turn so the newly-created buttons are present.
+        setTimeout(() => sync_modebar_active(host), 0);
       };
 
       if (!window[RUNTIME_KEY]) {
@@ -840,28 +912,49 @@ layout:
           if (!host) return;
 
           const button_el = event?.composedPath?.().find((el) => {
-            const title = el?.getAttribute?.("data-title");
-            const aria = el?.getAttribute?.("aria-label");
-            return title === "Toggle Spike Lines" ||
-              aria === "Toggle Spike Lines";
+            const raw = el?.className?.baseVal ?? el?.className ?? "";
+            return String(raw).split(/\s+/).includes("modebar-btn");
           });
 
           if (!button_el) return;
 
-          // Prevent Plotly's own all-axis click handler from seeing this click.
-          event.preventDefault();
-          event.stopPropagation();
-          event.stopImmediatePropagation();
+          const title =
+            button_el.getAttribute?.("data-title") ??
+            button_el.getAttribute?.("aria-label") ??
+            "";
 
-          ensure_host(host);
+          if (title === "Toggle Spike Lines") {
+            // Prevent Plotly's own all-axis click handler from seeing this click.
+            event.preventDefault();
+            event.stopPropagation();
+            event.stopImmediatePropagation();
 
-          const state = window[STATE_KEY];
-          state.spikes = !(state.spikes ?? true);
+            ensure_host(host);
 
-          // Re-render from already-cached data. This does not fetch Recorder
-          // history and, unlike direct Plotly.relayout(), is available from
-          // YAML because it uses the card's own public runtime method.
-          host.plot({should_fetch: false});
+            const state = window[STATE_KEY];
+            state.spikes = !(state.spikes ?? true);
+
+            // Re-render from already-cached data. The xaxis.showspikes function
+            // reads state.spikes; both Y-axis spikes remain false.
+            Promise.resolve(
+              host.plot({should_fetch: false})
+            ).then(() => {
+              sync_modebar_active(host);
+            });
+            return;
+          }
+
+          // Let Plotly handle Zoom/Pan and Closest/Compare normally. Its click
+          // handler updates fullLayout; synchronize immediately afterward so
+          // active state is obvious even if the theme/default styling is subtle.
+          if (
+            title === "Zoom" ||
+            title === "Pan" ||
+            title === "Show closest data on hover" ||
+            title === "Compare data on hover"
+          ) {
+            setTimeout(() => sync_modebar_active(host), 0);
+          }
         };
 
         // Capture runs before Plotly's own button/drag/wheel handlers, allowing
@@ -946,6 +1039,7 @@ layout:
 
         window[RUNTIME_KEY] = {
           ensure_host,
+          sync_modebar_active,
           on_click,
           on_pointerdown,
           on_touchstart,
@@ -954,8 +1048,15 @@ layout:
         };
       }
 
-      return "ac-condenser-v33";
+      return "ac-condenser-v34";
     }
+
+  # Make active modebar state visually obvious. Plotly's defaults use only an
+  # opacity change; use HA's normal secondary text color for inactive icons and
+  # the theme primary/accent color for active icons.
+  modebar:
+    color: $ex css_vars["secondary-text-color"]
+    activecolor: $ex css_vars["primary-color"]
 
   # In a Panel view, this makes the graph approximately fill the browser
   # viewport vertically as well as horizontally. Adjust 70 if your HA
