@@ -1,7 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v37: v36 behavior plus explicit persistent drag mode. The 24h button
-# resets dragmode to Pan while preserving hover mode and spike-line state.
+# v38: v37 behavior plus outdoor-temperature history on a hidden fixed
+# 15-120 F third Y axis, with point labels, legend visibility, and a
+# moderately smoothed violet spline.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -56,13 +57,16 @@ refresh_interval: auto
 #   0 internal Stage-2 helper
 #   1 condenser power
 #   2 visible Stage-2 trace
-# Internal Stage 2 and Total fetch history. The visible Stage-2 trace reuses
-# the internal Stage-2 cache instead of issuing a duplicate Recorder fetch.
-# This also preserves the workaround for the card's internal-entity mask index.
+#   3 outdoor temperature
+# Internal Stage 2, Total, and Outdoor Temperature fetch history. The visible
+# Stage-2 trace reuses the internal Stage-2 cache instead of issuing a duplicate
+# Recorder fetch. This also preserves the workaround for the card's
+# internal-entity mask index.
 fetch_mask:
   - true
   - true
   - false
+  - true
 
 entities:
   # Historical helper trace only. It is not drawn and does not consume
@@ -92,7 +96,11 @@ entities:
           LINE_COLOR: "#ffe060",
           RAIL_COLOR: "#8b0000",
           MARKER_SIZE_PX: 5,
-          RAIL_MARKER_SIZE_PX: 10
+          RAIL_MARKER_SIZE_PX: 10,
+          OUTDOOR_TEMP_MIN_F: 15,
+          OUTDOOR_TEMP_MAX_F: 120,
+          OUTDOOR_TEMP_COLOR: "#7e57c2",
+          OUTDOOR_TEMP_SMOOTHING: 0.6
         };
 
         // Exact timestamp parsing is relatively expensive (regex + Date.parse).
@@ -427,6 +435,74 @@ entities:
     filters:
       - map_y_numbers: y * 1000
 
+
+  # Outdoor temperature. Its Fahrenheit unit makes Plotly Graph Card assign
+  # it to y3 automatically. y3 is intentionally hidden below: the labels
+  # carry the scale information without adding a third visible axis.
+  - entity: sensor.outdoor_temperature
+    name: Outdoor Temperature
+    unit_of_measurement: "°F"
+    mode: lines+markers+text
+    extend_to_present: false
+    showlegend: true
+    cliponaxis: false
+
+    # Visible by default; native legend click toggles it and the state persists
+    # across the card's reparses/navigation.
+    visible: |
+      $fn () => {
+        window.__acCondenserPlotV22State ??= {
+          power: true,
+          stage2: false,
+          live: true,
+          liveHours: 24
+        };
+        return (window.__acCondenserPlotV22State.outdoor ?? true)
+          ? true
+          : "legendonly";
+      }
+
+    on_legend_click: |
+      $fn () => (event_data) => {
+        window.__acCondenserPlotV22State ??= {
+          power: true,
+          stage2: false,
+          live: true,
+          liveHours: 24
+        };
+
+        const trace = event_data.data?.[event_data.curveNumber];
+        const is_visible =
+          trace?.visible !== false && trace?.visible !== "legendonly";
+        window.__acCondenserPlotV22State.outdoor = !is_visible;
+
+        return true;
+      }
+
+    line:
+      color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
+      width: 2
+      shape: spline
+      smoothing: $ex vars.cfg.OUTDOOR_TEMP_SMOOTHING
+
+    marker:
+      color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
+      size: 5
+      symbol: circle
+
+    # One compact label at each actual HA weather-derived update.
+    texttemplate: "%{y:.0f}°"
+    textposition: top center
+    textfont:
+      color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
+      size: 10
+
+    hovertemplate: |
+      <b>Outdoor Temperature</b><br>
+      %{x|%Y-%m-%d %H:%M:%S}<br>
+      %{y:.1f} °F
+      <extra></extra>
+
 layout:
   # Runtime glue for sticky-live behavior AND interaction performance.
   #
@@ -437,7 +513,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV37Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV38Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -579,6 +655,30 @@ layout:
           stale_v37.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV37Runtime;
+      }
+
+      // Clean an earlier v38 runtime if this YAML is hot-reloaded.
+      const stale_v38 = window.__acCondenserPlotV38Runtime;
+      if (stale_v38) {
+        if (stale_v38.on_click) {
+          window.removeEventListener("click", stale_v38.on_click, true);
+        }
+        if (stale_v38.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v38.on_pointerdown, true);
+        }
+        if (stale_v38.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v38.on_touchstart, true);
+        }
+        if (stale_v38.on_wheel) {
+          window.removeEventListener("wheel", stale_v38.on_wheel, true);
+        }
+        if (stale_v38.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v38.on_pointerup, true);
+        }
+        if (stale_v38.initialize_timer_ids) {
+          stale_v38.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV38Runtime;
       }
 
       const is_target_card = (el) => {
@@ -1252,7 +1352,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v37";
+      return "ac-condenser-v38";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
@@ -1484,6 +1584,15 @@ layout:
     range:
       - 0
       - 120
+    fixedrange: true
+
+  # Third overlaid scale used only to position Outdoor Temperature. Keep the
+  # axis itself invisible so there is no third tick/title scale competing with
+  # Power and Stage 2; each temperature sample is labeled directly.
+  yaxis3:
+    visible: false
+    showspikes: false
+    range: $ex [vars.cfg.OUTDOOR_TEMP_MIN_F, vars.cfg.OUTDOOR_TEMP_MAX_F]
     fixedrange: true
 
 config:
