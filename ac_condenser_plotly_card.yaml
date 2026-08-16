@@ -1,7 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v30: v28 behavior plus removal of Plotly's generic Autoscale and Reset axes
-# modebar buttons, which conflict with fixed Y ranges and custom X navigation.
+# v31: v30 behavior with an explicit modebar policy: keep PNG export, remove
+# incompatible/reset/selection controls, and add spike-line plus hover-mode controls.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -1097,9 +1097,19 @@ config:
   # Y is fixed, so wheel/drag zooming affects the time axis.
   scrollZoom: true
 
-  # Plotly's generic Autoscale button does not fit this card: Y axes are fixed,
-  # and X navigation/history loading is handled by the card's own controls and
-  # deferred relayout logic.
+  # Explicit modebar policy. Keep PNG export and the normal zoom/pan controls.
+  # Remove generic axis-reset controls (they bypass this card's X-history logic)
+  # and point-selection controls, which have no consumer here.
   modeBarButtonsToRemove:
     - autoScale2d
     - resetScale2d
+    - lasso2d
+    - select2d
+
+  # "Compare data on hover" is not itself a toggle, so expose the matching
+  # "Show closest data on hover" control as the way back to the default mode.
+  # Toggle Spike Lines lets the normally-on vertical spike line be switched.
+  modeBarButtonsToAdd:
+    - togglespikelines
+    - hoverclosest
+    - hovercompare
