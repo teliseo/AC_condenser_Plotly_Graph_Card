@@ -1,7 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v34: v33 behavior plus explicit, high-contrast modebar active-state
-# indication for Spike Lines, Closest/Compare hover, and Zoom/Pan modes.
+# v35: stable modebar state indication. Active state is represented only by
+# CSS + the .active class, avoiding conflicts with Plotly's own hover/click
+# fill handling; initial state is synchronized as soon as the modebar appears.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -437,7 +438,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV34Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV35Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -507,6 +508,30 @@ layout:
           window.removeEventListener("pointerup", stale_v34.on_pointerup, true);
         }
         delete window.__acCondenserPlotV34Runtime;
+      }
+
+      // Clean an earlier v35 runtime if this YAML is hot-reloaded.
+      const stale_v35 = window.__acCondenserPlotV35Runtime;
+      if (stale_v35) {
+        if (stale_v35.on_click) {
+          window.removeEventListener("click", stale_v35.on_click, true);
+        }
+        if (stale_v35.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v35.on_pointerdown, true);
+        }
+        if (stale_v35.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v35.on_touchstart, true);
+        }
+        if (stale_v35.on_wheel) {
+          window.removeEventListener("wheel", stale_v35.on_wheel, true);
+        }
+        if (stale_v35.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v35.on_pointerup, true);
+        }
+        if (stale_v35.initialize_timer_ids) {
+          stale_v35.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV35Runtime;
       }
 
       const is_target_card = (el) => {
@@ -801,6 +826,34 @@ layout:
         }
       };
 
+      const install_modebar_style = (host) => {
+        const root = host.shadowRoot;
+        if (!root || root.querySelector("#ac-condenser-modebar-v35-style")) {
+          return;
+        }
+
+        const style = document.createElement("style");
+        style.id = "ac-condenser-modebar-v35-style";
+        style.textContent = `
+          /*
+           * Plotly writes SVG path fill inline during hover/click. Own the
+           * visual state here instead so a momentary hover can never look like
+           * a selected mode.
+           *
+           * Unmanaged/action buttons (Zoom +/-, PNG) never receive .active and
+           * therefore remain neutral. Only the actual current mode/toggle gets
+           * the HA accent color.
+           */
+          #plotly .modebar-btn .icon path {
+            fill: var(--secondary-text-color) !important;
+          }
+          #plotly .modebar-btn.active .icon path {
+            fill: var(--primary-color) !important;
+          }
+        `;
+        root.appendChild(style);
+      };
+
       const sync_modebar_active = (host) => {
         if (!is_target_card(host)) return;
 
@@ -809,45 +862,97 @@ layout:
 
         const full = host.contentEl?._fullLayout ?? {};
         const state = window[STATE_KEY];
-        const dragmode = full.dragmode ?? host.contentEl?.layout?.dragmode ?? "zoom";
-        const hovermode = full.hovermode ?? host.contentEl?.layout?.hovermode ?? "closest";
+        const dragmode =
+          full.dragmode ??
+          host.contentEl?.layout?.dragmode ??
+          "zoom";
+        const hovermode =
+          full.hovermode ??
+          host.contentEl?.layout?.hovermode ??
+          "closest";
         const spikes = state.spikes ?? true;
 
-        const inactive =
-          full.modebar?.color ??
-          getComputedStyle(host.contentEl).getPropertyValue("--secondary-text-color") ??
-          "rgba(127,127,127,.5)";
-        const active =
-          full.modebar?.activecolor ??
-          getComputedStyle(host.contentEl).getPropertyValue("--primary-color") ??
-          "rgba(0,127,255,1)";
-
-        const states_by_title = {
-          "Zoom": dragmode === "zoom",
-          "Pan": dragmode === "pan",
-          "Show closest data on hover": hovermode === "closest",
-          "Compare data on hover": hovermode === "x" || hovermode === "y",
-          "Toggle Spike Lines": spikes
-        };
-
         modebar.querySelectorAll(".modebar-btn").forEach((button) => {
+          const attr = button.getAttribute("data-attr");
+          const val = button.getAttribute("data-val");
           const title =
             button.getAttribute("data-title") ??
-            button.getAttribute("aria-label");
-          if (!(title in states_by_title)) return;
+            button.getAttribute("aria-label") ??
+            "";
 
-          const is_active = Boolean(states_by_title[title]);
-          button.classList.toggle("active", is_active);
+          let managed = false;
+          let is_active = false;
 
-          const path = button.querySelector(".icon path");
-          if (path && !button.matches(":hover")) {
-            path.style.fill = is_active ? active : inactive;
+          // Mutually exclusive drag modes.
+          if (
+            attr === "dragmode" &&
+            (val === "zoom" || val === "pan")
+          ) {
+            managed = true;
+            is_active = dragmode === val;
           }
+
+          // Mutually exclusive hover modes.
+          else if (
+            attr === "hovermode" &&
+            (
+              val === "closest" ||
+              val === "x" ||
+              val === "y"
+            )
+          ) {
+            managed = true;
+            is_active =
+              val === "closest"
+                ? hovermode === "closest"
+                : hovermode === val;
+          }
+
+          // Our X-only spike toggle does not use Plotly's native all-axis
+          // state, so its active class comes from our persistent state.
+          else if (title === "Toggle Spike Lines") {
+            managed = true;
+            is_active = spikes;
+          }
+
+          if (managed) {
+            button.classList.toggle("active", is_active);
+          } else {
+            // Action buttons such as Zoom +/-, Zoom out, and PNG are actions,
+            // not persistent modes. They should never look selected.
+            button.classList.remove("active");
+          }
+        });
+      };
+
+      const schedule_modebar_sync = (host) => {
+        if (host.__acCondenserV35ModebarSyncQueued) return;
+        host.__acCondenserV35ModebarSyncQueued = true;
+
+        requestAnimationFrame(() => {
+          host.__acCondenserV35ModebarSyncQueued = false;
+          install_modebar_style(host);
+          sync_modebar_active(host);
         });
       };
 
       const ensure_host = (host) => {
         if (!is_target_card(host)) return;
+
+        install_modebar_style(host);
+
+        if (!host.__acCondenserV35ModebarObserver && host.contentEl) {
+          // Plotly can create or rebuild the modebar during Plotly.react().
+          // Watch DOM construction only; class changes are deliberately not
+          // observed, avoiding feedback loops with our own synchronization.
+          host.__acCondenserV35ModebarObserver = new MutationObserver(() => {
+            schedule_modebar_sync(host);
+          });
+          host.__acCondenserV35ModebarObserver.observe(host.contentEl, {
+            childList: true,
+            subtree: true
+          });
+        }
 
         if (host.resetButtonEl) {
           host.resetButtonEl.style.display = "none";
@@ -883,7 +988,7 @@ layout:
             if (host.isInternalRelayout) return;
 
             // Relayout is also emitted for dragmode/hovermode changes.
-            setTimeout(() => sync_modebar_active(host), 0);
+            schedule_modebar_sync(host);
 
             const range = range_from_relayout(event_data);
             if (!range) return;
@@ -897,12 +1002,41 @@ layout:
           host.__acCondenserV28RelayoutHandler = handler;
         }
 
-        // Modebar may be rebuilt by Plotly.react(); synchronize after the
-        // current JS turn so the newly-created buttons are present.
-        setTimeout(() => sync_modebar_active(host), 0);
+        // Synchronize after the current render turn. The observer above also
+        // catches initial creation and any later Plotly.react() rebuild.
+        schedule_modebar_sync(host);
       };
 
       if (!window[RUNTIME_KEY]) {
+        const find_target_cards = () => {
+          const found = [];
+
+          const visit = (root) => {
+            if (!root?.querySelectorAll) return;
+
+            root.querySelectorAll("*").forEach((el) => {
+              if (is_target_card(el)) found.push(el);
+              if (el.shadowRoot) visit(el.shadowRoot);
+            });
+          };
+
+          visit(document);
+          return found;
+        };
+
+        const initialize_visible_cards = () => {
+          find_target_cards().forEach((host) => {
+            ensure_host(host);
+            schedule_modebar_sync(host);
+          });
+        };
+
+        // meta is evaluated before Plotly.react() completes. Retry discovery
+        // briefly so initial active state appears without any user interaction.
+        const initialize_timer_ids = [0, 50, 150, 350, 750].map((delay) =>
+          setTimeout(initialize_visible_cards, delay)
+        );
+
         // Intercept the built-in Plotly spike toggle BEFORE its own click
         // handler runs. Plotly's native toggle intentionally changes every
         // Cartesian axis and maintains a global _cartesianSpikesEnabled flag;
@@ -939,7 +1073,7 @@ layout:
             Promise.resolve(
               host.plot({should_fetch: false})
             ).then(() => {
-              sync_modebar_active(host);
+              schedule_modebar_sync(host);
             });
             return;
           }
@@ -953,7 +1087,9 @@ layout:
             title === "Show closest data on hover" ||
             title === "Compare data on hover"
           ) {
-            setTimeout(() => sync_modebar_active(host), 0);
+            requestAnimationFrame(() => {
+              schedule_modebar_sync(host);
+            });
           }
         };
 
@@ -1040,6 +1176,8 @@ layout:
         window[RUNTIME_KEY] = {
           ensure_host,
           sync_modebar_active,
+          schedule_modebar_sync,
+          initialize_timer_ids,
           on_click,
           on_pointerdown,
           on_touchstart,
@@ -1048,15 +1186,8 @@ layout:
         };
       }
 
-      return "ac-condenser-v34";
+      return "ac-condenser-v35";
     }
-
-  # Make active modebar state visually obvious. Plotly's defaults use only an
-  # opacity change; use HA's normal secondary text color for inactive icons and
-  # the theme primary/accent color for active icons.
-  modebar:
-    color: $ex css_vars["secondary-text-color"]
-    activecolor: $ex css_vars["primary-color"]
 
   # In a Panel view, this makes the graph approximately fill the browser
   # viewport vertically as well as horizontally. Adjust 70 if your HA
