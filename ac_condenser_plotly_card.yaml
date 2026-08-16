@@ -1,8 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v28: v27 performance architecture plus cached exact-timestamp parsing,
-# lower-allocation viewport extraction, small history prefetch margins, and
-# skipping Stage-2 marker-pair work while the Stage-2 trace is hidden.
+# v29: v28 behavior plus removal of Plotly's generic Autoscale modebar button,
+# which conflicts with this card's fixed Y ranges and custom X navigation.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -1097,3 +1096,9 @@ layout:
 config:
   # Y is fixed, so wheel/drag zooming affects the time axis.
   scrollZoom: true
+
+  # Plotly's generic Autoscale button does not fit this card: Y axes are fixed,
+  # and X navigation/history loading is handled by the card's own controls and
+  # deferred relayout logic.
+  modeBarButtonsToRemove:
+    - autoScale2d
