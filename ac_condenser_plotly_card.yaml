@@ -1,7 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v40: v39 behavior with correct Shelly/weather source_ts parsing. source_ts
-# is a fractional Unix timestamp in seconds, not an ISO date string.
+# v41: v40 behavior plus explicit line breaks whenever adjacent temperature
+# source samples are more than 3.2 hours apart, even when both endpoints are valid.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -620,14 +620,45 @@ entities:
           }
         }
 
-        xs.length = rows.length;
-        ys.length = rows.length;
-
-        vars.outdoor_temp_customdata = new Array(rows.length);
-        vars.outdoor_temp_text = new Array(rows.length).fill("");
-        vars.outdoor_temp_marker_sizes = new Array(rows.length);
+        // Even when both adjacent samples are valid, do not visually imply
+        // continuity across an extended period with no source data. Insert a
+        // synthetic null midway between adjacent recorded samples separated by
+        // more than 3.2 hours. Plotly's default connectgaps:false then breaks
+        // the spline at that point. Existing long unknown blocks already
+        // contain nulls and therefore need no additional synthetic break.
+        const plotted_rows = [];
 
         for (let j = 0; j < rows.length; j++) {
+          const current = rows[j];
+          plotted_rows.push(current);
+
+          if (j + 1 >= rows.length) continue;
+
+          const next = rows[j + 1];
+          if (
+            current.y !== null &&
+            next.y !== null &&
+            next.t - current.t > max_gap_ms
+          ) {
+            plotted_rows.push({
+              t: current.t + (next.t - current.t) / 2,
+              y: null,
+              condition: "",
+              interpolated: false,
+              synthetic_gap: true
+            });
+          }
+        }
+
+        xs.length = plotted_rows.length;
+        ys.length = plotted_rows.length;
+
+        vars.outdoor_temp_customdata = new Array(plotted_rows.length);
+        vars.outdoor_temp_text = new Array(plotted_rows.length).fill("");
+        vars.outdoor_temp_marker_sizes = new Array(plotted_rows.length);
+
+        for (let j = 0; j < plotted_rows.length; j++) {
+          const row = plotted_rows[j];
           const row = rows[j];
           xs[j] = new Date(row.t);
           ys[j] = row.y;
@@ -674,7 +705,7 @@ entities:
           !Number.isFinite(x1) ||
           x1 <= x0
         ) {
-          const finite_rows = rows.filter((r) => r.y !== null);
+          const finite_rows = plotted_rows.filter((r) => r.y !== null);
           if (finite_rows.length) {
             x0 = finite_rows[0].t;
             x1 = finite_rows[finite_rows.length - 1].t;
@@ -696,20 +727,20 @@ entities:
 
         const candidates = [];
 
-        for (let j = 0; j < rows.length; j++) {
-          const row = rows[j];
+        for (let j = 0; j < plotted_rows.length; j++) {
+          const row = plotted_rows[j];
           if (row.y === null) continue;
 
           let is_extremum = false;
           if (
             j > 0 &&
-            j + 1 < rows.length &&
-            rows[j - 1].y !== null &&
-            rows[j + 1].y !== null
+            j + 1 < plotted_rows.length &&
+            plotted_rows[j - 1].y !== null &&
+            plotted_rows[j + 1].y !== null
           ) {
-            const yp = rows[j - 1].y;
+            const yp = plotted_rows[j - 1].y;
             const yc = row.y;
-            const yn = rows[j + 1].y;
+            const yn = plotted_rows[j + 1].y;
 
             is_extremum =
               (
@@ -726,7 +757,7 @@ entities:
 
           const is_endpoint =
             j === 0 ||
-            j === rows.length - 1;
+            j === plotted_rows.length - 1;
 
           let priority = 1;
           if (!row.interpolated) priority += 1;
@@ -765,7 +796,7 @@ entities:
         }
 
         for (const candidate of chosen) {
-          const row = rows[candidate.i];
+          const row = plotted_rows[candidate.i];
           const rounded = Math.round(row.y);
           vars.outdoor_temp_text[candidate.i] =
             row.interpolated
@@ -812,7 +843,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV40Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV41Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -1026,6 +1057,30 @@ layout:
           stale_v40.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV40Runtime;
+      }
+
+      // Clean an earlier v41 runtime if this YAML is hot-reloaded.
+      const stale_v41 = window.__acCondenserPlotV41Runtime;
+      if (stale_v41) {
+        if (stale_v41.on_click) {
+          window.removeEventListener("click", stale_v41.on_click, true);
+        }
+        if (stale_v41.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v41.on_pointerdown, true);
+        }
+        if (stale_v41.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v41.on_touchstart, true);
+        }
+        if (stale_v41.on_wheel) {
+          window.removeEventListener("wheel", stale_v41.on_wheel, true);
+        }
+        if (stale_v41.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v41.on_pointerup, true);
+        }
+        if (stale_v41.initialize_timer_ids) {
+          stale_v41.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV41Runtime;
       }
 
       const is_target_card = (el) => {
@@ -1713,7 +1768,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v40";
+      return "ac-condenser-v41";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
