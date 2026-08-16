@@ -1,8 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v35: stable modebar state indication. Active state is represented only by
-# CSS + the .active class, avoiding conflicts with Plotly's own hover/click
-# fill handling; initial state is synchronized as soon as the modebar appears.
+# v36: v35 behavior plus persistent hover mode. 24h/reset navigation preserves
+# Closest vs Compare hover selection while leaving spike state unchanged.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -438,7 +437,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV35Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV36Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -532,6 +531,30 @@ layout:
           stale_v35.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV35Runtime;
+      }
+
+      // Clean an earlier v36 runtime if this YAML is hot-reloaded.
+      const stale_v36 = window.__acCondenserPlotV36Runtime;
+      if (stale_v36) {
+        if (stale_v36.on_click) {
+          window.removeEventListener("click", stale_v36.on_click, true);
+        }
+        if (stale_v36.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v36.on_pointerdown, true);
+        }
+        if (stale_v36.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v36.on_touchstart, true);
+        }
+        if (stale_v36.on_wheel) {
+          window.removeEventListener("wheel", stale_v36.on_wheel, true);
+        }
+        if (stale_v36.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v36.on_pointerup, true);
+        }
+        if (stale_v36.initialize_timer_ids) {
+          stale_v36.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV36Runtime;
       }
 
       const is_target_card = (el) => {
@@ -987,6 +1010,17 @@ layout:
           const handler = (event_data) => {
             if (host.isInternalRelayout) return;
 
+            // Persist the user's hover-mode choice across later card reparses
+            // such as the 24h reset. Plotly emits hovermode in relayout.
+            const requested_hovermode = event_data?.hovermode;
+            if (
+              requested_hovermode === "closest" ||
+              requested_hovermode === "x" ||
+              requested_hovermode === "y"
+            ) {
+              window[STATE_KEY].hovermode = requested_hovermode;
+            }
+
             // Relayout is also emitted for dragmode/hovermode changes.
             schedule_modebar_sync(host);
 
@@ -1186,7 +1220,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v35";
+      return "ac-condenser-v36";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
@@ -1194,9 +1228,18 @@ layout:
   # header/navigation consumes a different amount of vertical space.
   height: $ex Math.max(100, window.innerHeight - 70)
 
-  # Keep normal per-point hover labels and draw a thin vertical dashed
-  # spikeline through the hovered/nearest data point.
-  hovermode: closest
+  # Preserve the user's Closest vs Compare choice across 24h/reset reparses.
+  # Default remains normal per-point closest hover.
+  hovermode: |
+    $fn () => {
+      window.__acCondenserPlotV22State ??= {
+        power: true,
+        stage2: false,
+        live: true,
+        liveHours: 24
+      };
+      return window.__acCondenserPlotV22State.hovermode ?? "closest";
+    }
 
   legend:
     orientation: h
