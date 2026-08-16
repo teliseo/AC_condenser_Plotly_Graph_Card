@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v32: v31 behavior plus X-only spike-line toggling. Plotly's built-in
-# toggleSpikelines affects every Cartesian axis; runtime normalization keeps
-# the desired vertical X-axis spike while forcing Y-axis spikes off.
+# v33: v31 behavior with a true X-only spike toggle. The built-in Plotly
+# spike-button click is intercepted before Plotly handles it; persistent card
+# state drives xaxis.showspikes while both Y-axis spikes remain disabled.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -438,8 +438,8 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV28Runtime";
-      const OLD_RUNTIME_KEY = "__acCondenserPlotV27Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV33Runtime";
+      const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
       const PREFETCH_MAX_MS = 60 * 60 * 1000;
@@ -466,6 +466,27 @@ layout:
           window.removeEventListener("pointerup", old.on_pointerup, true);
         }
         delete window[OLD_RUNTIME_KEY];
+      }
+
+      // Clean an earlier v33 runtime if this YAML is hot-reloaded.
+      const stale_v33 = window.__acCondenserPlotV33Runtime;
+      if (stale_v33) {
+        if (stale_v33.on_click) {
+          window.removeEventListener("click", stale_v33.on_click, true);
+        }
+        if (stale_v33.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v33.on_pointerdown, true);
+        }
+        if (stale_v33.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v33.on_touchstart, true);
+        }
+        if (stale_v33.on_wheel) {
+          window.removeEventListener("wheel", stale_v33.on_wheel, true);
+        }
+        if (stale_v33.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v33.on_pointerup, true);
+        }
+        delete window.__acCondenserPlotV33Runtime;
       }
 
       const is_target_card = (el) => {
@@ -796,40 +817,6 @@ layout:
           const handler = (event_data) => {
             if (host.isInternalRelayout) return;
 
-            // Plotly's built-in Toggle Spike Lines changes showspikes on every
-            // Cartesian axis. This card intentionally uses only the X-axis
-            // spike (a vertical cursor line), so normalize any spike-toggle
-            // relayout back to X-only without starting an expensive history
-            // fetch/reparse.
-            const spike_event =
-              event_data?.["xaxis.showspikes"] !== undefined ||
-              event_data?.["yaxis.showspikes"] !== undefined ||
-              event_data?.["yaxis2.showspikes"] !== undefined;
-
-            if (spike_event) {
-              const x_show =
-                event_data?.["xaxis.showspikes"] !== undefined
-                  ? Boolean(event_data["xaxis.showspikes"])
-                  : Boolean(host.contentEl?.layout?.xaxis?.showspikes);
-
-              const y1_show = Boolean(host.contentEl?.layout?.yaxis?.showspikes);
-              const y2_show = Boolean(host.contentEl?.layout?.yaxis2?.showspikes);
-
-              if (y1_show || y2_show) {
-                host.isInternalRelayout++;
-                Promise.resolve(
-                  window.Plotly?.relayout?.(host.contentEl, {
-                    "xaxis.showspikes": x_show,
-                    "yaxis.showspikes": false,
-                    "yaxis2.showspikes": false
-                  })
-                ).finally(() => {
-                  host.isInternalRelayout--;
-                });
-              }
-              return;
-            }
-
             const range = range_from_relayout(event_data);
             if (!range) return;
 
@@ -844,6 +831,39 @@ layout:
       };
 
       if (!window[RUNTIME_KEY]) {
+        // Intercept the built-in Plotly spike toggle BEFORE its own click
+        // handler runs. Plotly's native toggle intentionally changes every
+        // Cartesian axis and maintains a global _cartesianSpikesEnabled flag;
+        // correcting it afterward leaves that flag out of sync.
+        const on_click = (event) => {
+          const host = card_from_event(event);
+          if (!host) return;
+
+          const button_el = event?.composedPath?.().find((el) => {
+            const title = el?.getAttribute?.("data-title");
+            const aria = el?.getAttribute?.("aria-label");
+            return title === "Toggle Spike Lines" ||
+              aria === "Toggle Spike Lines";
+          });
+
+          if (!button_el) return;
+
+          // Prevent Plotly's own all-axis click handler from seeing this click.
+          event.preventDefault();
+          event.stopPropagation();
+          event.stopImmediatePropagation();
+
+          ensure_host(host);
+
+          const state = window[STATE_KEY];
+          state.spikes = !(state.spikes ?? true);
+
+          // Re-render from already-cached data. This does not fetch Recorder
+          // history and, unlike direct Plotly.relayout(), is available from
+          // YAML because it uses the card's own public runtime method.
+          host.plot({should_fetch: false});
+        };
+
         // Capture runs before Plotly's own button/drag/wheel handlers, allowing
         // us to install the optimized relayout listener before the first
         // plotly_relayout is emitted.
@@ -914,6 +934,7 @@ layout:
           }, double_click_delay + 350);
         };
 
+        window.addEventListener("click", on_click, true);
         window.addEventListener("pointerdown", on_pointerdown, true);
         window.addEventListener("touchstart", on_touchstart, true);
         window.addEventListener(
@@ -925,6 +946,7 @@ layout:
 
         window[RUNTIME_KEY] = {
           ensure_host,
+          on_click,
           on_pointerdown,
           on_touchstart,
           on_wheel,
@@ -932,7 +954,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v28";
+      return "ac-condenser-v33";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
@@ -958,7 +980,16 @@ layout:
     # re-evaluated whenever the card replots.
     maxallowed: $ex Date.now()
 
-    showspikes: true
+    showspikes: |
+      $fn () => {
+        window.__acCondenserPlotV22State ??= {
+          power: true,
+          stage2: false,
+          live: true,
+          liveHours: 24
+        };
+        return window.__acCondenserPlotV22State.spikes ?? true;
+      }
     spikemode: across
     spikesnap: data
     spikedash: dash
