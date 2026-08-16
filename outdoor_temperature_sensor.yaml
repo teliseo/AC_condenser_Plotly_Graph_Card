@@ -1,0 +1,20 @@
+# Programmatically defined sensor.outdoor_temperature that tracks from weather
+# data as an individual measurement. This block should be inserted in
+# configuration.yaml.
+template:
+  - sensor:
+      - name: "Outdoor Temperature"
+        unique_id: outdoor_temperature
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°F"
+
+        state: >
+          {{ state_attr('weather.forecast_home', 'temperature') }}
+
+        attributes:
+          condition: >
+            {{ states('weather.forecast_home') }}
+          source_ts: >
+            {{ as_timestamp(states.weather.forecast_home.last_updated)
+               if states.weather.forecast_home is defined else none }}
