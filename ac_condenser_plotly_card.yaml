@@ -1,7 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v29: v28 behavior plus removal of Plotly's generic Autoscale modebar button,
-# which conflicts with this card's fixed Y ranges and custom X navigation.
+# v30: v28 behavior plus removal of Plotly's generic Autoscale and Reset axes
+# modebar buttons, which conflict with fixed Y ranges and custom X navigation.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -1102,3 +1102,4 @@ config:
   # deferred relayout logic.
   modeBarButtonsToRemove:
     - autoScale2d
+    - resetScale2d
