@@ -1,7 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v42: v41 behavior with the temperature output-loop redeclaration fixed.
-# The >3.2-hour line-break logic is otherwise unchanged.
+# v43: v42 behavior with plateau-aware local-extrema labeling and
+# segment endpoints recognized on both sides of temperature-data gaps.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -724,44 +724,115 @@ entities:
             ? ((t - x0) / span) * plot_width
             : 0;
 
+        // Identify local extrema plateau-by-plateau, not point-by-point.
+        // This avoids false extrema at a flat step in a continuing trend:
+        //   65,64,64,63  => the 64 plateau is NOT a minimum
+        //   81,87,87,91  => the 87 plateau is NOT a maximum
+        // while correctly retaining:
+        //   63,62,62,63  => one representative 62 is a minimum
+        //   94,95,95,93  => one representative 95 is a maximum
+        const extremum_representatives = new Set();
+
+        let segment_start = 0;
+        while (segment_start < plotted_rows.length) {
+          while (
+            segment_start < plotted_rows.length &&
+            plotted_rows[segment_start].y === null
+          ) {
+            segment_start++;
+          }
+          if (segment_start >= plotted_rows.length) break;
+
+          let segment_end = segment_start;
+          while (
+            segment_end + 1 < plotted_rows.length &&
+            plotted_rows[segment_end + 1].y !== null
+          ) {
+            segment_end++;
+          }
+
+          let plateau_start = segment_start;
+          while (plateau_start <= segment_end) {
+            let plateau_end = plateau_start;
+            const plateau_y = plotted_rows[plateau_start].y;
+
+            while (
+              plateau_end + 1 <= segment_end &&
+              plotted_rows[plateau_end + 1].y === plateau_y
+            ) {
+              plateau_end++;
+            }
+
+            if (
+              plateau_start > segment_start &&
+              plateau_end < segment_end
+            ) {
+              const prev_y = plotted_rows[plateau_start - 1].y;
+              const next_y = plotted_rows[plateau_end + 1].y;
+
+              const is_true_extremum =
+                (plateau_y < prev_y && plateau_y < next_y) ||
+                (plateau_y > prev_y && plateau_y > next_y);
+
+              if (is_true_extremum) {
+                // Use the point closest to the plateau's temporal midpoint.
+                // For an exact tie, retain the earlier point.
+                const mid_t =
+                  (
+                    plotted_rows[plateau_start].t +
+                    plotted_rows[plateau_end].t
+                  ) / 2;
+
+                let representative = plateau_start;
+                let best_distance = Math.abs(
+                  plotted_rows[plateau_start].t - mid_t
+                );
+
+                for (
+                  let k = plateau_start + 1;
+                  k <= plateau_end;
+                  k++
+                ) {
+                  const distance = Math.abs(
+                    plotted_rows[k].t - mid_t
+                  );
+                  if (distance < best_distance) {
+                    best_distance = distance;
+                    representative = k;
+                  }
+                }
+
+                extremum_representatives.add(representative);
+              }
+            }
+
+            plateau_start = plateau_end + 1;
+          }
+
+          segment_start = segment_end + 1;
+        }
+
         const candidates = [];
 
         for (let j = 0; j < plotted_rows.length; j++) {
           const row = plotted_rows[j];
           if (row.y === null) continue;
 
-          let is_extremum = false;
-          if (
-            j > 0 &&
-            j + 1 < plotted_rows.length &&
-            plotted_rows[j - 1].y !== null &&
-            plotted_rows[j + 1].y !== null
-          ) {
-            const yp = plotted_rows[j - 1].y;
-            const yc = row.y;
-            const yn = plotted_rows[j + 1].y;
+          const is_extremum =
+            extremum_representatives.has(j);
 
-            is_extremum =
-              (
-                yc <= yp &&
-                yc <= yn &&
-                (yc < yp || yc < yn)
-              ) ||
-              (
-                yc >= yp &&
-                yc >= yn &&
-                (yc > yp || yc > yn)
-              );
-          }
-
+          // A segment endpoint includes either end of the whole trace AND
+          // either side of any explicit/synthetic null gap.
           const is_endpoint =
             j === 0 ||
-            j === plotted_rows.length - 1;
+            j === plotted_rows.length - 1 ||
+            plotted_rows[j - 1]?.y === null ||
+            plotted_rows[j + 1]?.y === null;
 
           let priority = 1;
           if (!row.interpolated) priority += 1;
-          if (is_endpoint) priority += 1;
-          if (is_extremum) priority += 4;
+          if (is_endpoint) priority += 3;
+          if (is_extremum) priority += 6;
 
           candidates.push({
             i: j,
@@ -842,7 +913,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV42Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV43Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -1104,6 +1175,30 @@ layout:
           stale_v42.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV42Runtime;
+      }
+
+      // Clean an earlier v43 runtime if this YAML is hot-reloaded.
+      const stale_v43 = window.__acCondenserPlotV43Runtime;
+      if (stale_v43) {
+        if (stale_v43.on_click) {
+          window.removeEventListener("click", stale_v43.on_click, true);
+        }
+        if (stale_v43.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v43.on_pointerdown, true);
+        }
+        if (stale_v43.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v43.on_touchstart, true);
+        }
+        if (stale_v43.on_wheel) {
+          window.removeEventListener("wheel", stale_v43.on_wheel, true);
+        }
+        if (stale_v43.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v43.on_pointerup, true);
+        }
+        if (stale_v43.initialize_timer_ids) {
+          stale_v43.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV43Runtime;
       }
 
       const is_target_card = (el) => {
@@ -1791,7 +1886,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v42";
+      return "ac-condenser-v43";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
