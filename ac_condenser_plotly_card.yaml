@@ -1,7 +1,7 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v43: v42 behavior with plateau-aware local-extrema labeling and
-# segment endpoints recognized on both sides of temperature-data gaps.
+# v44: v43 behavior with 2-D temperature-label collision checking.
+# Labels now consider vertical spacing as well as horizontal spacing.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -102,6 +102,7 @@ entities:
           OUTDOOR_TEMP_SMOOTHING: 0.6,
           OUTDOOR_TEMP_INTERPOLATE_MAX_HOURS: 3.2,
           OUTDOOR_TEMP_LABEL_MIN_PX: 18,
+          OUTDOOR_TEMP_LABEL_MIN_Y_PX: 12,
           OUTDOOR_TEMP_MARKER_SIZE_PX: 5,
           OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX: 4
         };
@@ -717,12 +718,28 @@ entities:
             ? Number(state_store.plotWidthPx)
             : Math.max(250, window.innerWidth - 120);
 
+        const plot_height =
+          Number.isFinite(Number(state_store.plotHeightPx)) &&
+          Number(state_store.plotHeightPx) > 0
+            ? Number(state_store.plotHeightPx)
+            : Math.max(180, window.innerHeight - 220);
+
         const min_label_px = cfg.OUTDOOR_TEMP_LABEL_MIN_PX;
+        const min_label_y_px = cfg.OUTDOOR_TEMP_LABEL_MIN_Y_PX;
         const span = x1 - x0;
+        const y_min = cfg.OUTDOOR_TEMP_MIN_F;
+        const y_max = cfg.OUTDOOR_TEMP_MAX_F;
+        const y_span = y_max - y_min;
+
         const px_at = (t) =>
           Number.isFinite(span) && span > 0
             ? ((t - x0) / span) * plot_width
             : 0;
+
+        const py_at = (y) =>
+          Number.isFinite(y) && Number.isFinite(y_span) && y_span > 0
+            ? (1 - ((y - y_min) / y_span)) * plot_height
+            : plot_height / 2;
 
         // Identify local extrema plateau-by-plateau, not point-by-point.
         // This avoids false extrema at a flat step in a continuing trend:
@@ -837,6 +854,7 @@ entities:
           candidates.push({
             i: j,
             px: px_at(row.t),
+            py: py_at(row.y),
             priority
           });
         }
@@ -853,9 +871,13 @@ entities:
           let too_close = false;
 
           for (const accepted of chosen) {
+            // Treat labels as conflicting only when they are close in BOTH
+            // axes. This lets a daily low and daily high coexist even if
+            // they are close in time, while still suppressing visually
+            // overlapping labels in truly dense regions.
             if (
-              Math.abs(candidate.px - accepted.px) <
-              min_label_px
+              Math.abs(candidate.px - accepted.px) < min_label_px &&
+              Math.abs(candidate.py - accepted.py) < min_label_y_px
             ) {
               too_close = true;
               break;
@@ -913,7 +935,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV43Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV44Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -1199,6 +1221,30 @@ layout:
           stale_v43.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV43Runtime;
+      }
+
+      // Clean an earlier v44 runtime if this YAML is hot-reloaded.
+      const stale_v44 = window.__acCondenserPlotV44Runtime;
+      if (stale_v44) {
+        if (stale_v44.on_click) {
+          window.removeEventListener("click", stale_v44.on_click, true);
+        }
+        if (stale_v44.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v44.on_pointerdown, true);
+        }
+        if (stale_v44.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v44.on_touchstart, true);
+        }
+        if (stale_v44.on_wheel) {
+          window.removeEventListener("wheel", stale_v44.on_wheel, true);
+        }
+        if (stale_v44.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v44.on_pointerup, true);
+        }
+        if (stale_v44.initialize_timer_ids) {
+          stale_v44.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV44Runtime;
       }
 
       const is_target_card = (el) => {
@@ -1609,6 +1655,9 @@ layout:
         const state = window[STATE_KEY];
         const actual_plot_width =
           Number(host.contentEl?._fullLayout?._size?.w);
+        const actual_plot_height =
+          Number(host.contentEl?._fullLayout?._size?.h);
+
         if (Number.isFinite(actual_plot_width) && actual_plot_width > 0) {
           state.plotWidthPx = actual_plot_width;
         } else {
@@ -1617,6 +1666,17 @@ layout:
             Number(host.clientWidth);
           if (Number.isFinite(fallback_width) && fallback_width > 0) {
             state.plotWidthPx = Math.max(250, fallback_width - 100);
+          }
+        }
+
+        if (Number.isFinite(actual_plot_height) && actual_plot_height > 0) {
+          state.plotHeightPx = actual_plot_height;
+        } else {
+          const fallback_height =
+            Number(host.contentEl?.clientHeight) ||
+            Number(host.clientHeight);
+          if (Number.isFinite(fallback_height) && fallback_height > 0) {
+            state.plotHeightPx = Math.max(180, fallback_height - 120);
           }
         }
 
@@ -1886,7 +1946,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v43";
+      return "ac-condenser-v44";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
