@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v45: v44 behavior with per-label position selection. Temperature labels can
-# use top/bottom/corner placements, with box-based collision checks and a mild
-# continuity preference so placements flow naturally until geometry forces a change.
+# v46: v45 behavior with strong temperature-label lane continuity.
+# Ordinary labels stay on one side of the curve between true extrema; if they
+# cannot fit in that lane they are omitted rather than flipped to the other side.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -846,6 +846,111 @@ entities:
           segment_start = segment_end + 1;
         }
 
+        // Assign a stable top/bottom label lane to every valid sample.
+        //
+        // Between genuine extrema the lane does not change:
+        //   after a minimum / while rising  -> bottom of the curve
+        //   after a maximum / while falling -> top of the curve
+        //
+        // The extrema themselves use their semantic sides (max top, min bottom).
+        // A null gap starts a new segment. This is intentionally stronger than
+        // v45's "preference": a later collision will thin labels instead of
+        // switching an ordinary label to the opposite side.
+        const lane_by_index =
+          new Array(plotted_rows.length).fill(null);
+        const run_id_by_index =
+          new Array(plotted_rows.length).fill(-1);
+
+        let next_run_id = 0;
+        let lane_segment_start = 0;
+
+        while (lane_segment_start < plotted_rows.length) {
+          while (
+            lane_segment_start < plotted_rows.length &&
+            plotted_rows[lane_segment_start].y === null
+          ) {
+            lane_segment_start++;
+          }
+          if (lane_segment_start >= plotted_rows.length) break;
+
+          let lane_segment_end = lane_segment_start;
+          while (
+            lane_segment_end + 1 < plotted_rows.length &&
+            plotted_rows[lane_segment_end + 1].y !== null
+          ) {
+            lane_segment_end++;
+          }
+
+          const extrema_in_segment = [];
+          for (
+            let k = lane_segment_start;
+            k <= lane_segment_end;
+            k++
+          ) {
+            const kind = extremum_representatives.get(k);
+            if (kind) {
+              extrema_in_segment.push({i: k, kind});
+            }
+          }
+
+          let current_lane;
+          if (extrema_in_segment.length) {
+            // Before the first visible knee, infer which side corresponds to
+            // the monotonic run leading into that extremum.
+            current_lane =
+              extrema_in_segment[0].kind === "max"
+                ? "bottom"
+                : "top";
+          } else {
+            // No visible knee: use the net segment direction.
+            const first_y = plotted_rows[lane_segment_start].y;
+            const last_y = plotted_rows[lane_segment_end].y;
+            current_lane =
+              last_y > first_y
+                ? "bottom"
+                : last_y < first_y
+                  ? "top"
+                  : (
+                      first_y >=
+                      (cfg.OUTDOOR_TEMP_MIN_F +
+                       cfg.OUTDOOR_TEMP_MAX_F) / 2
+                        ? "top"
+                        : "bottom"
+                    );
+          }
+
+          let current_run_id = next_run_id++;
+
+          for (
+            let k = lane_segment_start;
+            k <= lane_segment_end;
+            k++
+          ) {
+            const extremum_kind =
+              extremum_representatives.get(k);
+
+            if (extremum_kind) {
+              const extremum_lane =
+                extremum_kind === "max"
+                  ? "top"
+                  : "bottom";
+
+              lane_by_index[k] = extremum_lane;
+              run_id_by_index[k] = -1;
+
+              // A true extremum is the knee where the ordinary-label lane is
+              // allowed to change for subsequent samples.
+              current_lane = extremum_lane;
+              current_run_id = next_run_id++;
+            } else {
+              lane_by_index[k] = current_lane;
+              run_id_by_index[k] = current_run_id;
+            }
+          }
+
+          lane_segment_start = lane_segment_end + 1;
+        }
+
         const label_text_for_row = (row) => {
           const rounded = Math.round(row.y);
           return row.interpolated
@@ -931,114 +1036,85 @@ entities:
           candidate,
           previous_placed
         ) => {
+          const lane =
+            candidate.kind === "max"
+              ? "top"
+              : candidate.kind === "min"
+                ? "bottom"
+                : candidate.lane;
+
+          const rising = candidate.tempDelta >= 0;
+          const steep =
+            Number.isFinite(candidate.screenSlope) &&
+            Math.abs(candidate.screenSlope) >= 1.2;
+
           let positions;
 
-          if (candidate.kind === "max") {
-            positions = [
-              "top center",
-              "top left",
-              "top right",
-              "middle left",
-              "middle right",
-              "bottom left",
-              "bottom right",
-              "bottom center"
-            ];
-          } else if (candidate.kind === "min") {
-            positions = [
-              "bottom center",
-              "bottom left",
-              "bottom right",
-              "middle left",
-              "middle right",
-              "top left",
-              "top right",
-              "top center"
-            ];
-          } else {
-            const rising = candidate.tempDelta >= 0;
-            const steep =
-              Number.isFinite(candidate.screenSlope) &&
-              Math.abs(candidate.screenSlope) >= 1.2;
-
-            if (steep && rising) {
+          if (lane === "bottom") {
+            if (candidate.kind === "min") {
               positions = [
-                "top left",
-                "bottom right",
-                "top center",
-                "bottom center",
-                "top right",
-                "bottom left",
-                "middle left",
-                "middle right"
-              ];
-            } else if (steep && !rising) {
-              positions = [
-                "top right",
-                "bottom left",
-                "top center",
-                "bottom center",
-                "top left",
-                "bottom right",
-                "middle right",
-                "middle left"
-              ];
-            } else if (candidate.py < plot_height * 0.40) {
-              positions = [
-                "bottom center",
-                "bottom left",
-                "bottom right",
-                "middle left",
-                "middle right",
-                "top center",
-                "top left",
-                "top right"
-              ];
-            } else if (candidate.py > plot_height * 0.60) {
-              positions = [
-                "top center",
-                "top left",
-                "top right",
-                "middle left",
-                "middle right",
                 "bottom center",
                 "bottom left",
                 "bottom right"
               ];
-            } else if (rising) {
-              positions = [
-                "top left",
-                "bottom right",
-                "top center",
-                "bottom center",
-                "top right",
-                "bottom left",
-                "middle left",
-                "middle right"
-              ];
+            } else if (steep) {
+              positions = rising
+                ? [
+                    "bottom right",
+                    "bottom center",
+                    "bottom left"
+                  ]
+                : [
+                    "bottom left",
+                    "bottom center",
+                    "bottom right"
+                  ];
             } else {
               positions = [
-                "top right",
-                "bottom left",
-                "top center",
                 "bottom center",
+                "bottom left",
+                "bottom right"
+              ];
+            }
+          } else {
+            if (candidate.kind === "max") {
+              positions = [
+                "top center",
                 "top left",
-                "bottom right",
-                "middle right",
-                "middle left"
+                "top right"
+              ];
+            } else if (steep) {
+              positions = rising
+                ? [
+                    "top left",
+                    "top center",
+                    "top right"
+                  ]
+                : [
+                    "top right",
+                    "top center",
+                    "top left"
+                  ];
+            } else {
+              positions = [
+                "top center",
+                "top left",
+                "top right"
               ];
             }
           }
 
-          // Mild continuity preference: if the immediately earlier placed label
-          // is nearby in X, try its position first for ordinary/endpoint points.
-          // This keeps labels flowing naturally until geometry forces a change.
+          // Strong within-run continuity: once an ordinary label in this
+          // monotonic run establishes an exact placement, try that exact
+          // placement first for the next accepted label. We never add an
+          // opposite-lane fallback. If none of these same-lane positions fits,
+          // the label is omitted.
           if (
             previous_placed &&
-            candidate.kind !== "max" &&
-            candidate.kind !== "min" &&
-            Math.abs(candidate.px - previous_placed.px) <
-              min_label_px * 3
+            candidate.runId >= 0 &&
+            previous_placed.runId === candidate.runId &&
+            previous_placed.lane === lane &&
+            positions.includes(previous_placed.position)
           ) {
             positions = [
               previous_placed.position,
@@ -1146,6 +1222,8 @@ entities:
             py: py_at(row.y),
             priority,
             kind,
+            lane: lane_by_index[j],
+            runId: run_id_by_index[j],
             tempDelta,
             screenSlope,
             markerSize: vars.outdoor_temp_marker_sizes[j],
@@ -1249,7 +1327,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV45Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV46Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -1583,6 +1661,30 @@ layout:
           stale_v45.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV45Runtime;
+      }
+
+      // Clean an earlier v46 runtime if this YAML is hot-reloaded.
+      const stale_v46 = window.__acCondenserPlotV46Runtime;
+      if (stale_v46) {
+        if (stale_v46.on_click) {
+          window.removeEventListener("click", stale_v46.on_click, true);
+        }
+        if (stale_v46.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v46.on_pointerdown, true);
+        }
+        if (stale_v46.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v46.on_touchstart, true);
+        }
+        if (stale_v46.on_wheel) {
+          window.removeEventListener("wheel", stale_v46.on_wheel, true);
+        }
+        if (stale_v46.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v46.on_pointerup, true);
+        }
+        if (stale_v46.initialize_timer_ids) {
+          stale_v46.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV46Runtime;
       }
 
       const is_target_card = (el) => {
@@ -2284,7 +2386,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v45";
+      return "ac-condenser-v46";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
