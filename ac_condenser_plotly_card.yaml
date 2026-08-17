@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v48: v47 behavior with Plotly-matched text offsets and spline-aware
-# temperature-label collision checking. The actual smoothed local curve, not
-# merely the straight sample-to-sample chord, is tested against each label box.
+# v49: v48 behavior with neighborhood-wide temperature-line collision tests.
+# Each proposed label is tested against every nearby spline segment whose
+# screen-space X range can cross the label, not just the two attached segments.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -1323,22 +1323,82 @@ entities:
           return false;
         };
 
-        const box_hits_local_curve = (
+        const box_hits_nearby_curve = (
           candidate,
           box
         ) => {
-          return (
-            spline_segment_hits_box(
-              candidate.prevIndex,
-              candidate.i,
-              box
-            ) ||
-            spline_segment_hits_box(
-              candidate.i,
-              candidate.nextIndex,
-              box
-            )
-          );
+          // At wide zoom an hourly sample can be only 1-3 screen pixels from
+          // the next one while the text label is 20-30 px wide. Therefore the
+          // line crossing a label may belong to a sample several indices away.
+          //
+          // Walk outward from the candidate and test every spline segment whose
+          // endpoint X interval is near the label's horizontal footprint.
+          // Timestamps are monotonic, so once a segment is beyond the search
+          // window in either direction we can stop.
+          const search_pad =
+            cfg.OUTDOOR_TEMP_LABEL_LINE_CLEARANCE_PX + 8;
+          const search_left = box.left - search_pad;
+          const search_right = box.right + search_pad;
+
+          // Segments to the left: [j, j+1].
+          for (
+            let j = candidate.i - 1;
+            j >= 0;
+            j--
+          ) {
+            if (
+              plotted_rows[j]?.y === null ||
+              plotted_rows[j + 1]?.y === null
+            ) {
+              break;
+            }
+
+            const x0 = px_at(plotted_rows[j].t);
+            const x1 = px_at(plotted_rows[j + 1].t);
+
+            if (Math.max(x0, x1) < search_left) {
+              break;
+            }
+
+            if (
+              Math.min(x0, x1) <= search_right &&
+              Math.max(x0, x1) >= search_left &&
+              spline_segment_hits_box(j, j + 1, box)
+            ) {
+              return true;
+            }
+          }
+
+          // Segments to the right: [j, j+1].
+          for (
+            let j = candidate.i;
+            j + 1 < plotted_rows.length;
+            j++
+          ) {
+            if (
+              plotted_rows[j]?.y === null ||
+              plotted_rows[j + 1]?.y === null
+            ) {
+              break;
+            }
+
+            const x0 = px_at(plotted_rows[j].t);
+            const x1 = px_at(plotted_rows[j + 1].t);
+
+            if (Math.min(x0, x1) > search_right) {
+              break;
+            }
+
+            if (
+              Math.min(x0, x1) <= search_right &&
+              Math.max(x0, x1) >= search_left &&
+              spline_segment_hits_box(j, j + 1, box)
+            ) {
+              return true;
+            }
+          }
+
+          return false;
         };
 
         const candidate_positions = (
@@ -1415,7 +1475,7 @@ entities:
 
           // Strong within-run lane continuity, with a softer exact-corner
           // preference. A previous exact position is tried first, but the
-          // explicit local-spline intersection test below can veto it. We never
+          // neighborhood-wide spline intersection test below can veto it. We never
           // add an opposite-lane fallback; if no same-lane position is safe,
           // the label is omitted.
           if (
@@ -1562,9 +1622,9 @@ entities:
             if (!inside_plot(box)) continue;
 
             // Geometry outranks exact-position continuity. A carried corner
-            // that intersects the actual local spline is rejected here;
+            // crossed by any nearby spline segment is rejected here;
             // another position in the SAME lane is tried next.
-            if (box_hits_local_curve(candidate, box)) continue;
+            if (box_hits_nearby_curve(candidate, box)) continue;
 
             let collides = false;
             for (const other of accepted) {
@@ -1643,7 +1703,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV48Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV49Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -2049,6 +2109,30 @@ layout:
           stale_v48.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV48Runtime;
+      }
+
+      // Clean an earlier v49 runtime if this YAML is hot-reloaded.
+      const stale_v49 = window.__acCondenserPlotV49Runtime;
+      if (stale_v49) {
+        if (stale_v49.on_click) {
+          window.removeEventListener("click", stale_v49.on_click, true);
+        }
+        if (stale_v49.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v49.on_pointerdown, true);
+        }
+        if (stale_v49.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v49.on_touchstart, true);
+        }
+        if (stale_v49.on_wheel) {
+          window.removeEventListener("wheel", stale_v49.on_wheel, true);
+        }
+        if (stale_v49.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v49.on_pointerup, true);
+        }
+        if (stale_v49.initialize_timer_ids) {
+          stale_v49.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV49Runtime;
       }
 
       const is_target_card = (el) => {
@@ -2750,7 +2834,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v48";
+      return "ac-condenser-v49";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
