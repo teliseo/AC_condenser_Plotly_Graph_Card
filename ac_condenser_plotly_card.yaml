@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v49: v48 behavior with neighborhood-wide temperature-line collision tests.
-# Each proposed label is tested against every nearby spline segment whose
-# screen-space X range can cross the label, not just the two attached segments.
+# v50: v49 behavior with asymmetric line-clearance padding around temperature
+# labels. The marker-facing edge uses a small clearance so the curve's mandatory
+# attachment to the marker does not falsely veto otherwise-clear labels.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -108,6 +108,7 @@ entities:
           OUTDOOR_TEMP_LABEL_HEIGHT_PX: 12,
           OUTDOOR_TEMP_LABEL_FONT_SIZE_PX: 10,
           OUTDOOR_TEMP_LABEL_LINE_CLEARANCE_PX: 3,
+          OUTDOOR_TEMP_LABEL_MARKER_SIDE_CLEARANCE_PX: 1,
           OUTDOOR_TEMP_MARKER_SIZE_PX: 5,
           OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX: 4
         };
@@ -1024,7 +1025,8 @@ entities:
             top: baseline_y - ascent,
             bottom: baseline_y + descent,
             width,
-            height: ascent + descent
+            height: ascent + descent,
+            position
           };
         };
 
@@ -1054,10 +1056,30 @@ entities:
         ) => {
           const pad =
             cfg.OUTDOOR_TEMP_LABEL_LINE_CLEARANCE_PX;
-          const left = box.left - pad;
-          const right = box.right + pad;
-          const top = box.top - pad;
-          const bottom = box.bottom + pad;
+          const marker_pad =
+            cfg.OUTDOOR_TEMP_LABEL_MARKER_SIDE_CLEARANCE_PX;
+
+          // Keep the large safety margin away from the marker, but use only
+          // a small margin on the edge(s) facing the marker. Otherwise the
+          // protected rectangle can include the marker point itself, making
+          // every attached line segment a false collision.
+          const faces_top =
+            box.position?.includes("top");
+          const faces_bottom =
+            box.position?.includes("bottom");
+          const faces_left =
+            box.position?.includes("left");
+          const faces_right =
+            box.position?.includes("right");
+
+          const left =
+            box.left - (faces_right ? marker_pad : pad);
+          const right =
+            box.right + (faces_left ? marker_pad : pad);
+          const top =
+            box.top - (faces_bottom ? marker_pad : pad);
+          const bottom =
+            box.bottom + (faces_top ? marker_pad : pad);
 
           const dx = x2 - x1;
           const dy = y2 - y1;
@@ -1703,7 +1725,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV49Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV50Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -2133,6 +2155,30 @@ layout:
           stale_v49.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV49Runtime;
+      }
+
+      // Clean an earlier v50 runtime if this YAML is hot-reloaded.
+      const stale_v50 = window.__acCondenserPlotV50Runtime;
+      if (stale_v50) {
+        if (stale_v50.on_click) {
+          window.removeEventListener("click", stale_v50.on_click, true);
+        }
+        if (stale_v50.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v50.on_pointerdown, true);
+        }
+        if (stale_v50.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v50.on_touchstart, true);
+        }
+        if (stale_v50.on_wheel) {
+          window.removeEventListener("wheel", stale_v50.on_wheel, true);
+        }
+        if (stale_v50.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v50.on_pointerup, true);
+        }
+        if (stale_v50.initialize_timer_ids) {
+          stale_v50.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV50Runtime;
       }
 
       const is_target_card = (el) => {
@@ -2834,7 +2880,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v49";
+      return "ac-condenser-v50";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
