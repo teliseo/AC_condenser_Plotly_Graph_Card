@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v50: v49 behavior with asymmetric line-clearance padding around temperature
-# labels. The marker-facing edge uses a small clearance so the curve's mandatory
-# attachment to the marker does not falsely veto otherwise-clear labels.
+# v51: v50 behavior with density-aware temperature-line collision checking.
+# True extrema are never removed by the curve veto, and ordinary labels use the
+# neighborhood-wide line veto only when samples are horizontally compressed.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -109,6 +109,7 @@ entities:
           OUTDOOR_TEMP_LABEL_FONT_SIZE_PX: 10,
           OUTDOOR_TEMP_LABEL_LINE_CLEARANCE_PX: 3,
           OUTDOOR_TEMP_LABEL_MARKER_SIDE_CLEARANCE_PX: 1,
+          OUTDOOR_TEMP_LABEL_CURVE_VETO_DENSITY_FACTOR: 1.35,
           OUTDOOR_TEMP_MARKER_SIZE_PX: 5,
           OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX: 4
         };
@@ -756,6 +757,54 @@ entities:
           Number.isFinite(y) && Number.isFinite(y_span) && y_span > 0
             ? (1 - ((y - y_min) / y_span)) * plot_height
             : plot_height / 2;
+
+        // Screen-space sample density controls whether the expensive/strict
+        // curve-vs-label veto is needed. At sparse zoom levels a label no
+        // longer spans multiple neighboring samples, so applying the dense-view
+        // veto only removes useful labels without adding meaningful protection.
+        const visible_sample_dx = [];
+        let previous_visible_x = null;
+
+        for (const row of plotted_rows) {
+          if (
+            row.y === null ||
+            row.t < x0 ||
+            row.t > x1
+          ) {
+            continue;
+          }
+
+          const x = px_at(row.t);
+
+          if (previous_visible_x !== null) {
+            const dx = x - previous_visible_x;
+            if (Number.isFinite(dx) && dx > 0) {
+              visible_sample_dx.push(dx);
+            }
+          }
+
+          previous_visible_x = x;
+        }
+
+        visible_sample_dx.sort((a, b) => a - b);
+
+        const median_sample_dx =
+          visible_sample_dx.length
+            ? (
+                visible_sample_dx.length % 2
+                  ? visible_sample_dx[
+                      Math.floor(visible_sample_dx.length / 2)
+                    ]
+                  : (
+                      visible_sample_dx[
+                        visible_sample_dx.length / 2 - 1
+                      ] +
+                      visible_sample_dx[
+                        visible_sample_dx.length / 2
+                      ]
+                    ) / 2
+              )
+            : Infinity;
 
         // Identify local extrema plateau-by-plateau, not point-by-point.
         // This avoids false extrema at a flat step in a continuing trend:
@@ -1643,10 +1692,31 @@ entities:
 
             if (!inside_plot(box)) continue;
 
-            // Geometry outranks exact-position continuity. A carried corner
-            // crossed by any nearby spline segment is rejected here;
-            // another position in the SAME lane is tried next.
-            if (box_hits_nearby_curve(candidate, box)) continue;
+            // Dense-view curve protection is intentionally conditional.
+            //
+            // - True extrema are always kept eligible: maxima belong above and
+            //   minima below, and conservative curve geometry must not erase
+            //   the most informative daily labels.
+            // - Ordinary/endpoint/interpolated labels use v49's neighborhood
+            //   curve veto only while the median sample spacing is small
+            //   relative to this label's width. As we zoom in, this condition
+            //   turns off, so more labels can appear monotonically.
+            const is_true_extremum =
+              candidate.kind === "max" ||
+              candidate.kind === "min";
+
+            const dense_for_this_label =
+              median_sample_dx <
+              box.width *
+                cfg.OUTDOOR_TEMP_LABEL_CURVE_VETO_DENSITY_FACTOR;
+
+            if (
+              !is_true_extremum &&
+              dense_for_this_label &&
+              box_hits_nearby_curve(candidate, box)
+            ) {
+              continue;
+            }
 
             let collides = false;
             for (const other of accepted) {
@@ -1725,7 +1795,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV50Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV51Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -2179,6 +2249,30 @@ layout:
           stale_v50.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV50Runtime;
+      }
+
+      // Clean an earlier v51 runtime if this YAML is hot-reloaded.
+      const stale_v51 = window.__acCondenserPlotV51Runtime;
+      if (stale_v51) {
+        if (stale_v51.on_click) {
+          window.removeEventListener("click", stale_v51.on_click, true);
+        }
+        if (stale_v51.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v51.on_pointerdown, true);
+        }
+        if (stale_v51.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v51.on_touchstart, true);
+        }
+        if (stale_v51.on_wheel) {
+          window.removeEventListener("wheel", stale_v51.on_wheel, true);
+        }
+        if (stale_v51.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v51.on_pointerup, true);
+        }
+        if (stale_v51.initialize_timer_ids) {
+          stale_v51.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV51Runtime;
       }
 
       const is_target_card = (el) => {
@@ -2880,7 +2974,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v50";
+      return "ac-condenser-v51";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
