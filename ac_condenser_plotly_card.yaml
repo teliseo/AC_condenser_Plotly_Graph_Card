@@ -1,7 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v44: v43 behavior with 2-D temperature-label collision checking.
-# Labels now consider vertical spacing as well as horizontal spacing.
+# v45: v44 behavior with per-label position selection. Temperature labels can
+# use top/bottom/corner placements, with box-based collision checks and a mild
+# continuity preference so placements flow naturally until geometry forces a change.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -103,6 +104,8 @@ entities:
           OUTDOOR_TEMP_INTERPOLATE_MAX_HOURS: 3.2,
           OUTDOOR_TEMP_LABEL_MIN_PX: 18,
           OUTDOOR_TEMP_LABEL_MIN_Y_PX: 12,
+          OUTDOOR_TEMP_LABEL_CHAR_WIDTH_PX: 7,
+          OUTDOOR_TEMP_LABEL_HEIGHT_PX: 12,
           OUTDOOR_TEMP_MARKER_SIZE_PX: 5,
           OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX: 4
         };
@@ -656,6 +659,7 @@ entities:
 
         vars.outdoor_temp_customdata = new Array(plotted_rows.length);
         vars.outdoor_temp_text = new Array(plotted_rows.length).fill("");
+        vars.outdoor_temp_textposition = new Array(plotted_rows.length).fill("top center");
         vars.outdoor_temp_marker_sizes = new Array(plotted_rows.length);
 
         for (let j = 0; j < plotted_rows.length; j++) {
@@ -692,10 +696,16 @@ entities:
               : cfg.OUTDOOR_TEMP_MARKER_SIZE_PX;
         }
 
-        // Scatter text has no built-in collision avoidance. Estimate horizontal
-        // pixel positions from the visible time range and plotting width, then
-        // greedily keep labels separated by >= 18 px. Extrema are selected
-        // first, then endpoints/actual samples, then interpolated samples.
+        // Plotly scatter text does not auto-place or avoid collisions for us.
+        // We therefore:
+        //   1) estimate each label's screen-space point,
+        //   2) classify extrema / endpoints / ordinary points,
+        //   3) choose among top/bottom/corner positions per point,
+        //   4) accept labels greedily by priority using actual label-box overlap.
+        //
+        // This allows a daily high and daily low to coexist even when close in
+        // time, and lets minima prefer positions below the trough while maxima
+        // prefer positions above the crest.
         const visible = getFromConfig("visible_range");
         let x0 = to_ms(visible?.[0]);
         let x1 = to_ms(visible?.[1]);
@@ -726,6 +736,9 @@ entities:
 
         const min_label_px = cfg.OUTDOOR_TEMP_LABEL_MIN_PX;
         const min_label_y_px = cfg.OUTDOOR_TEMP_LABEL_MIN_Y_PX;
+        const char_width_px = cfg.OUTDOOR_TEMP_LABEL_CHAR_WIDTH_PX;
+        const label_height_px = cfg.OUTDOOR_TEMP_LABEL_HEIGHT_PX;
+
         const span = x1 - x0;
         const y_min = cfg.OUTDOOR_TEMP_MIN_F;
         const y_max = cfg.OUTDOOR_TEMP_MAX_F;
@@ -748,7 +761,7 @@ entities:
         // while correctly retaining:
         //   63,62,62,63  => one representative 62 is a minimum
         //   94,95,95,93  => one representative 95 is a maximum
-        const extremum_representatives = new Set();
+        const extremum_representatives = new Map();
 
         let segment_start = 0;
         while (segment_start < plotted_rows.length) {
@@ -787,13 +800,14 @@ entities:
               const prev_y = plotted_rows[plateau_start - 1].y;
               const next_y = plotted_rows[plateau_end + 1].y;
 
-              const is_true_extremum =
-                (plateau_y < prev_y && plateau_y < next_y) ||
-                (plateau_y > prev_y && plateau_y > next_y);
+              let extremum_kind = null;
+              if (plateau_y < prev_y && plateau_y < next_y) {
+                extremum_kind = "min";
+              } else if (plateau_y > prev_y && plateau_y > next_y) {
+                extremum_kind = "max";
+              }
 
-              if (is_true_extremum) {
-                // Use the point closest to the plateau's temporal midpoint.
-                // For an exact tie, retain the earlier point.
+              if (extremum_kind) {
                 const mid_t =
                   (
                     plotted_rows[plateau_start].t +
@@ -819,7 +833,10 @@ entities:
                   }
                 }
 
-                extremum_representatives.add(representative);
+                extremum_representatives.set(
+                  representative,
+                  extremum_kind
+                );
               }
             }
 
@@ -829,71 +846,368 @@ entities:
           segment_start = segment_end + 1;
         }
 
+        const label_text_for_row = (row) => {
+          const rounded = Math.round(row.y);
+          return row.interpolated
+            ? `~${rounded}°`
+            : `${rounded}°`;
+        };
+
+        const label_box_for = (
+          candidate,
+          position
+        ) => {
+          const marker_size =
+            candidate.markerSize ??
+            cfg.OUTDOOR_TEMP_MARKER_SIZE_PX;
+          const text = candidate.labelText;
+          const width =
+            Math.max(18, text.length * char_width_px + 4);
+          const height = label_height_px;
+          const gap = marker_size / 2 + 6;
+
+          let cx = candidate.px;
+          let cy = candidate.py;
+
+          switch (position) {
+            case "top center":
+              cy -= gap + height / 2;
+              break;
+            case "bottom center":
+              cy += gap + height / 2;
+              break;
+            case "top left":
+              cx -= width / 2 + 6;
+              cy -= gap + height / 2;
+              break;
+            case "top right":
+              cx += width / 2 + 6;
+              cy -= gap + height / 2;
+              break;
+            case "bottom left":
+              cx -= width / 2 + 6;
+              cy += gap + height / 2;
+              break;
+            case "bottom right":
+              cx += width / 2 + 6;
+              cy += gap + height / 2;
+              break;
+            case "middle left":
+              cx -= width / 2 + 6;
+              break;
+            case "middle right":
+              cx += width / 2 + 6;
+              break;
+            case "middle center":
+            default:
+              break;
+          }
+
+          return {
+            left: cx - width / 2,
+            right: cx + width / 2,
+            top: cy - height / 2,
+            bottom: cy + height / 2,
+            width,
+            height
+          };
+        };
+
+        const inside_plot = (box) =>
+          box.left >= 0 &&
+          box.right <= plot_width &&
+          box.top >= 0 &&
+          box.bottom <= plot_height;
+
+        const boxes_overlap = (a, b) =>
+          !(
+            a.right + 2 <= b.left ||
+            a.left >= b.right + 2 ||
+            a.bottom + 1 <= b.top ||
+            a.top >= b.bottom + 1
+          );
+
+        const candidate_positions = (
+          candidate,
+          previous_placed
+        ) => {
+          let positions;
+
+          if (candidate.kind === "max") {
+            positions = [
+              "top center",
+              "top left",
+              "top right",
+              "middle left",
+              "middle right",
+              "bottom left",
+              "bottom right",
+              "bottom center"
+            ];
+          } else if (candidate.kind === "min") {
+            positions = [
+              "bottom center",
+              "bottom left",
+              "bottom right",
+              "middle left",
+              "middle right",
+              "top left",
+              "top right",
+              "top center"
+            ];
+          } else {
+            const rising = candidate.tempDelta >= 0;
+            const steep =
+              Number.isFinite(candidate.screenSlope) &&
+              Math.abs(candidate.screenSlope) >= 1.2;
+
+            if (steep && rising) {
+              positions = [
+                "top left",
+                "bottom right",
+                "top center",
+                "bottom center",
+                "top right",
+                "bottom left",
+                "middle left",
+                "middle right"
+              ];
+            } else if (steep && !rising) {
+              positions = [
+                "top right",
+                "bottom left",
+                "top center",
+                "bottom center",
+                "top left",
+                "bottom right",
+                "middle right",
+                "middle left"
+              ];
+            } else if (candidate.py < plot_height * 0.40) {
+              positions = [
+                "bottom center",
+                "bottom left",
+                "bottom right",
+                "middle left",
+                "middle right",
+                "top center",
+                "top left",
+                "top right"
+              ];
+            } else if (candidate.py > plot_height * 0.60) {
+              positions = [
+                "top center",
+                "top left",
+                "top right",
+                "middle left",
+                "middle right",
+                "bottom center",
+                "bottom left",
+                "bottom right"
+              ];
+            } else if (rising) {
+              positions = [
+                "top left",
+                "bottom right",
+                "top center",
+                "bottom center",
+                "top right",
+                "bottom left",
+                "middle left",
+                "middle right"
+              ];
+            } else {
+              positions = [
+                "top right",
+                "bottom left",
+                "top center",
+                "bottom center",
+                "top left",
+                "bottom right",
+                "middle right",
+                "middle left"
+              ];
+            }
+          }
+
+          // Mild continuity preference: if the immediately earlier placed label
+          // is nearby in X, try its position first for ordinary/endpoint points.
+          // This keeps labels flowing naturally until geometry forces a change.
+          if (
+            previous_placed &&
+            candidate.kind !== "max" &&
+            candidate.kind !== "min" &&
+            Math.abs(candidate.px - previous_placed.px) <
+              min_label_px * 3
+          ) {
+            positions = [
+              previous_placed.position,
+              ...positions.filter(
+                (p) => p !== previous_placed.position
+              )
+            ];
+          }
+
+          return positions;
+        };
+
+        const find_previous_placed = (
+          t,
+          accepted
+        ) => {
+          let previous = null;
+          for (const item of accepted) {
+            if (
+              item.t < t &&
+              (!previous || item.t > previous.t)
+            ) {
+              previous = item;
+            }
+          }
+          return previous;
+        };
+
         const candidates = [];
 
         for (let j = 0; j < plotted_rows.length; j++) {
           const row = plotted_rows[j];
           if (row.y === null) continue;
 
-          const is_extremum =
-            extremum_representatives.has(j);
-
-          // A segment endpoint includes either end of the whole trace AND
-          // either side of any explicit/synthetic null gap.
           const is_endpoint =
             j === 0 ||
             j === plotted_rows.length - 1 ||
             plotted_rows[j - 1]?.y === null ||
             plotted_rows[j + 1]?.y === null;
 
+          const kind =
+            extremum_representatives.get(j) ??
+            (is_endpoint
+              ? "endpoint"
+              : (row.interpolated ? "interpolated" : "ordinary"));
+
+          const prev_j =
+            j > 0 && plotted_rows[j - 1]?.y !== null
+              ? j - 1
+              : null;
+          const next_j =
+            j + 1 < plotted_rows.length &&
+            plotted_rows[j + 1]?.y !== null
+              ? j + 1
+              : null;
+
+          let tempDelta = 0;
+          let screenSlope = 0;
+
+          if (prev_j !== null && next_j !== null) {
+            tempDelta =
+              plotted_rows[next_j].y -
+              plotted_rows[prev_j].y;
+            const dx =
+              px_at(plotted_rows[next_j].t) -
+              px_at(plotted_rows[prev_j].t);
+            const dy =
+              py_at(plotted_rows[next_j].y) -
+              py_at(plotted_rows[prev_j].y);
+            screenSlope =
+              Math.abs(dx) > 0.001 ? dy / dx : Math.sign(dy) * 999;
+          } else if (next_j !== null) {
+            tempDelta =
+              plotted_rows[next_j].y - row.y;
+            const dx =
+              px_at(plotted_rows[next_j].t) -
+              px_at(row.t);
+            const dy =
+              py_at(plotted_rows[next_j].y) -
+              py_at(row.y);
+            screenSlope =
+              Math.abs(dx) > 0.001 ? dy / dx : Math.sign(dy) * 999;
+          } else if (prev_j !== null) {
+            tempDelta =
+              row.y - plotted_rows[prev_j].y;
+            const dx =
+              px_at(row.t) -
+              px_at(plotted_rows[prev_j].t);
+            const dy =
+              py_at(row.y) -
+              py_at(plotted_rows[prev_j].y);
+            screenSlope =
+              Math.abs(dx) > 0.001 ? dy / dx : Math.sign(dy) * 999;
+          }
+
           let priority = 1;
           if (!row.interpolated) priority += 1;
-          if (is_endpoint) priority += 3;
-          if (is_extremum) priority += 6;
+          if (kind === "endpoint") priority += 3;
+          if (kind === "max" || kind === "min") priority += 6;
 
           candidates.push({
             i: j,
+            t: row.t,
             px: px_at(row.t),
             py: py_at(row.y),
-            priority
+            priority,
+            kind,
+            tempDelta,
+            screenSlope,
+            markerSize: vars.outdoor_temp_marker_sizes[j],
+            labelText: label_text_for_row(row)
           });
         }
 
         candidates.sort(
           (a, b) =>
             b.priority - a.priority ||
-            a.i - b.i
+            a.t - b.t
         );
 
-        const chosen = [];
+        const accepted = [];
 
         for (const candidate of candidates) {
-          let too_close = false;
+          const previous_placed =
+            find_previous_placed(candidate.t, accepted);
+          const positions =
+            candidate_positions(candidate, previous_placed);
 
-          for (const accepted of chosen) {
-            // Treat labels as conflicting only when they are close in BOTH
-            // axes. This lets a daily low and daily high coexist even if
-            // they are close in time, while still suppressing visually
-            // overlapping labels in truly dense regions.
-            if (
-              Math.abs(candidate.px - accepted.px) < min_label_px &&
-              Math.abs(candidate.py - accepted.py) < min_label_y_px
-            ) {
-              too_close = true;
-              break;
+          for (const position of positions) {
+            const box = label_box_for(candidate, position);
+
+            if (!inside_plot(box)) continue;
+
+            let collides = false;
+            for (const other of accepted) {
+              if (boxes_overlap(box, other.box)) {
+                collides = true;
+                break;
+              }
+
+              // Retain a small additional "same-lane" guard even when boxes
+              // narrowly miss, so dense zoomed-out labels do not form a nearly
+              // continuous ribbon above or below the curve.
+              if (
+                Math.abs(candidate.px - other.px) < min_label_px &&
+                Math.abs(candidate.py - other.py) < min_label_y_px &&
+                Math.abs(box.top - other.box.top) < label_height_px
+              ) {
+                collides = true;
+                break;
+              }
             }
-          }
 
-          if (!too_close) chosen.push(candidate);
+            if (collides) continue;
+
+            accepted.push({
+              ...candidate,
+              position,
+              box
+            });
+            break;
+          }
         }
 
-        for (const candidate of chosen) {
-          const row = plotted_rows[candidate.i];
-          const rounded = Math.round(row.y);
+        for (const candidate of accepted) {
           vars.outdoor_temp_text[candidate.i] =
-            row.interpolated
-              ? `~${rounded}°`
-              : `${rounded}°`;
+            candidate.labelText;
+          vars.outdoor_temp_textposition[candidate.i] =
+            candidate.position;
         }
 
         return null;
@@ -912,7 +1226,7 @@ entities:
 
     text: $ex vars.outdoor_temp_text
     texttemplate: "%{text}"
-    textposition: top center
+    textposition: $ex vars.outdoor_temp_textposition
     textfont:
       color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
       size: 10
@@ -935,7 +1249,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV44Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV45Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -1245,6 +1559,30 @@ layout:
           stale_v44.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV44Runtime;
+      }
+
+      // Clean an earlier v45 runtime if this YAML is hot-reloaded.
+      const stale_v45 = window.__acCondenserPlotV45Runtime;
+      if (stale_v45) {
+        if (stale_v45.on_click) {
+          window.removeEventListener("click", stale_v45.on_click, true);
+        }
+        if (stale_v45.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v45.on_pointerdown, true);
+        }
+        if (stale_v45.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v45.on_touchstart, true);
+        }
+        if (stale_v45.on_wheel) {
+          window.removeEventListener("wheel", stale_v45.on_wheel, true);
+        }
+        if (stale_v45.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v45.on_pointerup, true);
+        }
+        if (stale_v45.initialize_timer_ids) {
+          stale_v45.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV45Runtime;
       }
 
       const is_target_card = (el) => {
@@ -1946,7 +2284,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v44";
+      return "ac-condenser-v45";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
