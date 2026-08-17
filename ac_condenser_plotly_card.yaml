@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v46: v45 behavior with strong temperature-label lane continuity.
-# Ordinary labels stay on one side of the curve between true extrema; if they
-# cannot fit in that lane they are omitted rather than flipped to the other side.
+# v47: v46 behavior plus an explicit local-line intersection veto for
+# temperature labels. Lane continuity remains strong, but a carried corner
+# position is rejected if the adjacent temperature line would cross the label.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -106,6 +106,7 @@ entities:
           OUTDOOR_TEMP_LABEL_MIN_Y_PX: 12,
           OUTDOOR_TEMP_LABEL_CHAR_WIDTH_PX: 7,
           OUTDOOR_TEMP_LABEL_HEIGHT_PX: 12,
+          OUTDOOR_TEMP_LABEL_LINE_CLEARANCE_PX: 3,
           OUTDOOR_TEMP_MARKER_SIZE_PX: 5,
           OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX: 4
         };
@@ -1032,6 +1033,93 @@ entities:
             a.top >= b.bottom + 1
           );
 
+        // Liang-Barsky line clipping against a label rectangle expanded by a
+        // small clearance. `true` means the local temperature segment enters
+        // the label's protected area and the placement must be rejected.
+        const segment_hits_box = (
+          x1,
+          y1,
+          x2,
+          y2,
+          box
+        ) => {
+          const pad =
+            cfg.OUTDOOR_TEMP_LABEL_LINE_CLEARANCE_PX;
+          const left = box.left - pad;
+          const right = box.right + pad;
+          const top = box.top - pad;
+          const bottom = box.bottom + pad;
+
+          const dx = x2 - x1;
+          const dy = y2 - y1;
+          let t0 = 0;
+          let t1 = 1;
+
+          const clip = (p, q) => {
+            if (Math.abs(p) < 1e-9) {
+              return q >= 0;
+            }
+
+            const r = q / p;
+
+            if (p < 0) {
+              if (r > t1) return false;
+              if (r > t0) t0 = r;
+            } else {
+              if (r < t0) return false;
+              if (r < t1) t1 = r;
+            }
+
+            return true;
+          };
+
+          return (
+            clip(-dx, x1 - left) &&
+            clip(dx, right - x1) &&
+            clip(-dy, y1 - top) &&
+            clip(dy, bottom - y1)
+          );
+        };
+
+        const box_hits_local_line = (
+          candidate,
+          box
+        ) => {
+          if (candidate.prevIndex !== null) {
+            const prev = plotted_rows[candidate.prevIndex];
+            if (
+              prev?.y !== null &&
+              segment_hits_box(
+                px_at(prev.t),
+                py_at(prev.y),
+                candidate.px,
+                candidate.py,
+                box
+              )
+            ) {
+              return true;
+            }
+          }
+
+          if (candidate.nextIndex !== null) {
+            const next = plotted_rows[candidate.nextIndex];
+            if (
+              next?.y !== null &&
+              segment_hits_box(
+                candidate.px,
+                candidate.py,
+                px_at(next.t),
+                py_at(next.y),
+                box
+              )
+            ) {
+              return true;
+            }
+          }
+
+          return false;
+        };
+
         const candidate_positions = (
           candidate,
           previous_placed
@@ -1104,10 +1192,10 @@ entities:
             }
           }
 
-          // Strong within-run continuity: once an ordinary label in this
-          // monotonic run establishes an exact placement, try that exact
-          // placement first for the next accepted label. We never add an
-          // opposite-lane fallback. If none of these same-lane positions fits,
+          // Strong within-run lane continuity, with a softer exact-corner
+          // preference. A previous exact position is tried first, but the
+          // explicit local-line intersection test below can veto it. We never
+          // add an opposite-lane fallback; if no same-lane position is safe,
           // the label is omitted.
           if (
             previous_placed &&
@@ -1224,6 +1312,8 @@ entities:
             kind,
             lane: lane_by_index[j],
             runId: run_id_by_index[j],
+            prevIndex: prev_j,
+            nextIndex: next_j,
             tempDelta,
             screenSlope,
             markerSize: vars.outdoor_temp_marker_sizes[j],
@@ -1249,6 +1339,11 @@ entities:
             const box = label_box_for(candidate, position);
 
             if (!inside_plot(box)) continue;
+
+            // Geometry outranks exact-position continuity. A carried corner
+            // that has become aligned with the local slope is rejected here;
+            // another position in the SAME lane is tried next.
+            if (box_hits_local_line(candidate, box)) continue;
 
             let collides = false;
             for (const other of accepted) {
@@ -1327,7 +1422,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV46Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV47Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -1685,6 +1780,30 @@ layout:
           stale_v46.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV46Runtime;
+      }
+
+      // Clean an earlier v47 runtime if this YAML is hot-reloaded.
+      const stale_v47 = window.__acCondenserPlotV47Runtime;
+      if (stale_v47) {
+        if (stale_v47.on_click) {
+          window.removeEventListener("click", stale_v47.on_click, true);
+        }
+        if (stale_v47.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v47.on_pointerdown, true);
+        }
+        if (stale_v47.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v47.on_touchstart, true);
+        }
+        if (stale_v47.on_wheel) {
+          window.removeEventListener("wheel", stale_v47.on_wheel, true);
+        }
+        if (stale_v47.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v47.on_pointerup, true);
+        }
+        if (stale_v47.initialize_timer_ids) {
+          stale_v47.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV47Runtime;
       }
 
       const is_target_card = (el) => {
@@ -2386,7 +2505,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v46";
+      return "ac-condenser-v47";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
