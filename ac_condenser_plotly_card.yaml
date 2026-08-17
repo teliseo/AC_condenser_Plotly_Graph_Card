@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v47: v46 behavior plus an explicit local-line intersection veto for
-# temperature labels. Lane continuity remains strong, but a carried corner
-# position is rejected if the adjacent temperature line would cross the label.
+# v48: v47 behavior with Plotly-matched text offsets and spline-aware
+# temperature-label collision checking. The actual smoothed local curve, not
+# merely the straight sample-to-sample chord, is tested against each label box.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -106,6 +106,7 @@ entities:
           OUTDOOR_TEMP_LABEL_MIN_Y_PX: 12,
           OUTDOOR_TEMP_LABEL_CHAR_WIDTH_PX: 7,
           OUTDOOR_TEMP_LABEL_HEIGHT_PX: 12,
+          OUTDOOR_TEMP_LABEL_FONT_SIZE_PX: 10,
           OUTDOOR_TEMP_LABEL_LINE_CLEARANCE_PX: 3,
           OUTDOOR_TEMP_MARKER_SIZE_PX: 5,
           OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX: 4
@@ -966,56 +967,64 @@ entities:
           const marker_size =
             candidate.markerSize ??
             cfg.OUTDOOR_TEMP_MARKER_SIZE_PX;
+          const marker_radius = marker_size / 2;
+          const font_size =
+            cfg.OUTDOOR_TEMP_LABEL_FONT_SIZE_PX;
           const text = candidate.labelText;
           const width =
-            Math.max(18, text.length * char_width_px + 4);
-          const height = label_height_px;
-          const gap = marker_size / 2 + 6;
+            Math.max(
+              18,
+              text.length *
+                cfg.OUTDOOR_TEMP_LABEL_CHAR_WIDTH_PX +
+                4
+            );
 
-          let cx = candidate.px;
-          let cy = candidate.py;
+          // Match Plotly Drawing.textPointPosition() for one-line scatter text.
+          const r =
+            marker_radius > 0
+              ? marker_radius / 0.8 + 1
+              : 0;
 
-          switch (position) {
-            case "top center":
-              cy -= gap + height / 2;
-              break;
-            case "bottom center":
-              cy += gap + height / 2;
-              break;
-            case "top left":
-              cx -= width / 2 + 6;
-              cy -= gap + height / 2;
-              break;
-            case "top right":
-              cx += width / 2 + 6;
-              cy -= gap + height / 2;
-              break;
-            case "bottom left":
-              cx -= width / 2 + 6;
-              cy += gap + height / 2;
-              break;
-            case "bottom right":
-              cx += width / 2 + 6;
-              cy += gap + height / 2;
-              break;
-            case "middle left":
-              cx -= width / 2 + 6;
-              break;
-            case "middle right":
-              cx += width / 2 + 6;
-              break;
-            case "middle center":
-            default:
-              break;
+          const is_top = position.includes("top");
+          const is_bottom = position.includes("bottom");
+          const is_left = position.includes("left");
+          const is_right = position.includes("right");
+
+          const v_sign =
+            is_top ? -1 : is_bottom ? 1 : 0;
+          const baseline_y =
+            candidate.py +
+            font_size * 0.75 +
+            v_sign * r +
+            ((v_sign - 1) * font_size) / 2;
+
+          // Slightly conservative glyph extents around Plotly's 10 px text.
+          const ascent = font_size * 0.90 + 1;
+          const descent = font_size * 0.30 + 1;
+
+          let left;
+          let right;
+
+          if (is_left) {
+            // Plotly text-anchor:end with dx=-r.
+            right = candidate.px - r;
+            left = right - width;
+          } else if (is_right) {
+            // Plotly text-anchor:start with dx=+r.
+            left = candidate.px + r;
+            right = left + width;
+          } else {
+            left = candidate.px - width / 2;
+            right = candidate.px + width / 2;
           }
 
           return {
-            left: cx - width / 2,
-            right: cx + width / 2,
-            top: cy - height / 2,
-            bottom: cy + height / 2,
+            left,
+            right,
+            top: baseline_y - ascent,
+            bottom: baseline_y + descent,
             width,
-            height
+            height: ascent + descent
           };
         };
 
@@ -1034,8 +1043,8 @@ entities:
           );
 
         // Liang-Barsky line clipping against a label rectangle expanded by a
-        // small clearance. `true` means the local temperature segment enters
-        // the label's protected area and the placement must be rejected.
+        // small clearance. `true` means the tested line piece enters the
+        // label's protected area.
         const segment_hits_box = (
           x1,
           y1,
@@ -1081,43 +1090,255 @@ entities:
           );
         };
 
-        const box_hits_local_line = (
-          candidate,
+        const pixel_point = (index) => {
+          const row = plotted_rows[index];
+          return [
+            px_at(row.t),
+            py_at(row.y)
+          ];
+        };
+
+        // Plotly uses a generalized centripetal Catmull-Rom spline
+        // (CatmullRomExp = 0.5) for scatter line.shape:spline.
+        // This mirrors Drawing.makeTangent() closely enough for collision
+        // testing; Plotly's final 0.01 px rounding is intentionally omitted.
+        const spline_tangent = (index) => {
+          if (
+            index <= 0 ||
+            index + 1 >= plotted_rows.length ||
+            plotted_rows[index - 1]?.y === null ||
+            plotted_rows[index]?.y === null ||
+            plotted_rows[index + 1]?.y === null
+          ) {
+            return null;
+          }
+
+          const prev = pixel_point(index - 1);
+          const cur = pixel_point(index);
+          const next = pixel_point(index + 1);
+
+          const d1x = prev[0] - cur[0];
+          const d1y = prev[1] - cur[1];
+          const d2x = next[0] - cur[0];
+          const d2y = next[1] - cur[1];
+
+          const d1a = Math.pow(
+            d1x * d1x + d1y * d1y,
+            0.25
+          );
+          const d2a = Math.pow(
+            d2x * d2x + d2y * d2y,
+            0.25
+          );
+
+          const smoothness =
+            cfg.OUTDOOR_TEMP_SMOOTHING;
+          const numx =
+            (
+              d2a * d2a * d1x -
+              d1a * d1a * d2x
+            ) * smoothness;
+          const numy =
+            (
+              d2a * d2a * d1y -
+              d1a * d1a * d2y
+            ) * smoothness;
+
+          const denom1 =
+            3 * d2a * (d1a + d2a);
+          const denom2 =
+            3 * d1a * (d1a + d2a);
+
+          return [
+            [
+              cur[0] + (denom1 ? numx / denom1 : 0),
+              cur[1] + (denom1 ? numy / denom1 : 0)
+            ],
+            [
+              cur[0] - (denom2 ? numx / denom2 : 0),
+              cur[1] - (denom2 ? numy / denom2 : 0)
+            ]
+          ];
+        };
+
+        const quadratic_point = (
+          p0,
+          c,
+          p1,
+          t
+        ) => {
+          const u = 1 - t;
+          return [
+            u * u * p0[0] +
+              2 * u * t * c[0] +
+              t * t * p1[0],
+            u * u * p0[1] +
+              2 * u * t * c[1] +
+              t * t * p1[1]
+          ];
+        };
+
+        const cubic_point = (
+          p0,
+          c1,
+          c2,
+          p1,
+          t
+        ) => {
+          const u = 1 - t;
+          return [
+            u * u * u * p0[0] +
+              3 * u * u * t * c1[0] +
+              3 * u * t * t * c2[0] +
+              t * t * t * p1[0],
+            u * u * u * p0[1] +
+              3 * u * u * t * c1[1] +
+              3 * u * t * t * c2[1] +
+              t * t * t * p1[1]
+          ];
+        };
+
+        const spline_segment_hits_box = (
+          i0,
+          i1,
           box
         ) => {
-          if (candidate.prevIndex !== null) {
-            const prev = plotted_rows[candidate.prevIndex];
-            if (
-              prev?.y !== null &&
-              segment_hits_box(
-                px_at(prev.t),
-                py_at(prev.y),
-                candidate.px,
-                candidate.py,
-                box
-              )
-            ) {
-              return true;
+          if (
+            i0 === null ||
+            i1 === null ||
+            i1 !== i0 + 1 ||
+            plotted_rows[i0]?.y === null ||
+            plotted_rows[i1]?.y === null
+          ) {
+            return false;
+          }
+
+          const p0 = pixel_point(i0);
+          const p1 = pixel_point(i1);
+
+          const has_prev =
+            i0 > 0 &&
+            plotted_rows[i0 - 1]?.y !== null;
+          const has_next =
+            i1 + 1 < plotted_rows.length &&
+            plotted_rows[i1 + 1]?.y !== null;
+
+          let curve_point;
+
+          if (!has_prev && !has_next) {
+            curve_point = (t) => [
+              p0[0] + (p1[0] - p0[0]) * t,
+              p0[1] + (p1[1] - p0[1]) * t
+            ];
+          } else if (!has_prev) {
+            const tangent1 = spline_tangent(i1);
+            if (!tangent1) {
+              curve_point = (t) => [
+                p0[0] + (p1[0] - p0[0]) * t,
+                p0[1] + (p1[1] - p0[1]) * t
+              ];
+            } else {
+              curve_point = (t) =>
+                quadratic_point(
+                  p0,
+                  tangent1[0],
+                  p1,
+                  t
+                );
+            }
+          } else if (!has_next) {
+            const tangent0 = spline_tangent(i0);
+            if (!tangent0) {
+              curve_point = (t) => [
+                p0[0] + (p1[0] - p0[0]) * t,
+                p0[1] + (p1[1] - p0[1]) * t
+              ];
+            } else {
+              curve_point = (t) =>
+                quadratic_point(
+                  p0,
+                  tangent0[1],
+                  p1,
+                  t
+                );
+            }
+          } else {
+            const tangent0 = spline_tangent(i0);
+            const tangent1 = spline_tangent(i1);
+
+            if (!tangent0 || !tangent1) {
+              curve_point = (t) => [
+                p0[0] + (p1[0] - p0[0]) * t,
+                p0[1] + (p1[1] - p0[1]) * t
+              ];
+            } else {
+              curve_point = (t) =>
+                cubic_point(
+                  p0,
+                  tangent0[1],
+                  tangent1[0],
+                  p1,
+                  t
+                );
             }
           }
 
-          if (candidate.nextIndex !== null) {
-            const next = plotted_rows[candidate.nextIndex];
+          // Subdivide the curve into short micro-segments and test each
+          // against the protected label box.
+          const chord =
+            Math.hypot(
+              p1[0] - p0[0],
+              p1[1] - p0[1]
+            );
+          const steps =
+            Math.max(
+              8,
+              Math.min(
+                32,
+                Math.ceil(chord / 4)
+              )
+            );
+
+          let prev = curve_point(0);
+
+          for (let s = 1; s <= steps; s++) {
+            const cur =
+              curve_point(s / steps);
+
             if (
-              next?.y !== null &&
               segment_hits_box(
-                candidate.px,
-                candidate.py,
-                px_at(next.t),
-                py_at(next.y),
+                prev[0],
+                prev[1],
+                cur[0],
+                cur[1],
                 box
               )
             ) {
               return true;
             }
+
+            prev = cur;
           }
 
           return false;
+        };
+
+        const box_hits_local_curve = (
+          candidate,
+          box
+        ) => {
+          return (
+            spline_segment_hits_box(
+              candidate.prevIndex,
+              candidate.i,
+              box
+            ) ||
+            spline_segment_hits_box(
+              candidate.i,
+              candidate.nextIndex,
+              box
+            )
+          );
         };
 
         const candidate_positions = (
@@ -1194,7 +1415,7 @@ entities:
 
           // Strong within-run lane continuity, with a softer exact-corner
           // preference. A previous exact position is tried first, but the
-          // explicit local-line intersection test below can veto it. We never
+          // explicit local-spline intersection test below can veto it. We never
           // add an opposite-lane fallback; if no same-lane position is safe,
           // the label is omitted.
           if (
@@ -1341,9 +1562,9 @@ entities:
             if (!inside_plot(box)) continue;
 
             // Geometry outranks exact-position continuity. A carried corner
-            // that has become aligned with the local slope is rejected here;
+            // that intersects the actual local spline is rejected here;
             // another position in the SAME lane is tried next.
-            if (box_hits_local_line(candidate, box)) continue;
+            if (box_hits_local_curve(candidate, box)) continue;
 
             let collides = false;
             for (const other of accepted) {
@@ -1422,7 +1643,7 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV47Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV48Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
@@ -1804,6 +2025,30 @@ layout:
           stale_v47.initialize_timer_ids.forEach(clearTimeout);
         }
         delete window.__acCondenserPlotV47Runtime;
+      }
+
+      // Clean an earlier v48 runtime if this YAML is hot-reloaded.
+      const stale_v48 = window.__acCondenserPlotV48Runtime;
+      if (stale_v48) {
+        if (stale_v48.on_click) {
+          window.removeEventListener("click", stale_v48.on_click, true);
+        }
+        if (stale_v48.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v48.on_pointerdown, true);
+        }
+        if (stale_v48.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v48.on_touchstart, true);
+        }
+        if (stale_v48.on_wheel) {
+          window.removeEventListener("wheel", stale_v48.on_wheel, true);
+        }
+        if (stale_v48.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v48.on_pointerup, true);
+        }
+        if (stale_v48.initialize_timer_ids) {
+          stale_v48.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV48Runtime;
       }
 
       const is_target_card = (el) => {
@@ -2505,7 +2750,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v47";
+      return "ac-condenser-v48";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
