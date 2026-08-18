@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v51: v50 behavior with density-aware temperature-line collision checking.
-# True extrema are never removed by the curve veto, and ordinary labels use the
-# neighborhood-wide line veto only when samples are horizontally compressed.
+# v52: v51 behavior plus real off-screen edge context for Total and Temperature.
+# Plotly clips lines/splines at the X-axis edges using real neighboring samples,
+# avoiding plotly-graph-card's asymmetric synthetic-left/truncated-right behavior.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -213,8 +213,75 @@ entities:
     #   2. Otherwise use the most recent earlier Stage-2 value for coloring.
     # This does NOT alter, resample, add, remove, or move Total points.
     fn: |
-      $fn ({states, vars}) => {
+      $fn ({states, xs, ys, vars, getFromConfig}) => {
         const cfg = vars.cfg;
+
+        const to_ms = (v) => {
+          if (v instanceof Date) return v.getTime();
+          if (typeof v === "number") return v;
+          const ms = Date.parse(String(v ?? ""));
+          return Number.isFinite(ms) ? ms : NaN;
+        };
+
+        const visible = getFromConfig("visible_range");
+        const view_start = to_ms(visible?.[0]);
+        const view_end = to_ms(visible?.[1]);
+
+        const edge_context =
+          window.__acCondenserEdgeContextV52?.power;
+
+        const context_matches =
+          edge_context &&
+          Number.isFinite(view_start) &&
+          Number.isFinite(view_end) &&
+          Math.abs(edge_context.range?.[0] - view_start) < 2 &&
+          Math.abs(edge_context.range?.[1] - view_end) < 2;
+
+        if (context_matches && edge_context.rows?.length) {
+          const rebuilt = [];
+
+          for (const row of edge_context.rows) {
+            const state = row?.state;
+            if (!state) continue;
+
+            const actual_ms = Date.parse(
+              state.last_updated ??
+              state.last_changed ??
+              ""
+            );
+
+            const x_ms =
+              Number.isFinite(actual_ms)
+                ? actual_ms
+                : Number(row.x);
+
+            if (!Number.isFinite(x_ms)) continue;
+
+            rebuilt.push({
+              x_ms,
+              state,
+              y: (
+                state.state === "unavailable" ||
+                state.state === "none" ||
+                state.state === "unknown"
+              )
+                ? null
+                : Number(state.state)
+            });
+          }
+
+          rebuilt.sort((a, b) => a.x_ms - b.x_ms);
+
+          xs.length = rebuilt.length;
+          ys.length = rebuilt.length;
+          states.length = rebuilt.length;
+
+          for (let i = 0; i < rebuilt.length; i++) {
+            xs[i] = new Date(rebuilt[i].x_ms);
+            ys[i] = rebuilt[i].y;
+            states[i] = rebuilt[i].state;
+          }
+        }
         const tolerance_us = cfg.MATCH_TOLERANCE_MS * 1000;
         const stage2_times = vars.stage2_times_us ?? [];
         const stage2_values = vars.stage2_values ?? [];
@@ -302,12 +369,20 @@ entities:
           else symbol = "circle";
 
           vars.power_symbols[i] = symbol;
+          const x_ms = +xs[i];
+          const is_offscreen =
+            Number.isFinite(view_start) &&
+            Number.isFinite(view_end) &&
+            (x_ms < view_start || x_ms > view_end);
+
           vars.power_sizes[i] =
-            is_midrange
-              ? cfg.MIDRANGE_MARKER_SIZE_PX
-              : is_rail
-                ? cfg.RAIL_MARKER_SIZE_PX
-                : cfg.MARKER_SIZE_PX;
+            is_offscreen
+              ? 0
+              : is_midrange
+                ? cfg.MIDRANGE_MARKER_SIZE_PX
+                : is_rail
+                  ? cfg.RAIL_MARKER_SIZE_PX
+                  : cfg.MARKER_SIZE_PX;
 
           vars.power_colors[i] =
             is_midrange
@@ -334,6 +409,11 @@ entities:
     line:
       color: $ex vars.cfg.LINE_COLOR
       width: 2
+      shape: linear
+
+    # Explicit rather than relying on Plotly's default. Null/unknown samples
+    # break the Total line; elapsed time alone does not.
+    connectgaps: false
 
     marker:
       symbol: $ex vars.power_symbols
@@ -532,6 +612,27 @@ entities:
           return Number.isFinite(ms) ? ms : NaN;
         };
 
+        const visible = getFromConfig("visible_range");
+        const view_start = to_ms(visible?.[0]);
+        const view_end = to_ms(visible?.[1]);
+
+        const edge_context =
+          window.__acCondenserEdgeContextV52?.temperature;
+
+        const context_matches =
+          edge_context &&
+          Number.isFinite(view_start) &&
+          Number.isFinite(view_end) &&
+          Math.abs(edge_context.range?.[0] - view_start) < 2 &&
+          Math.abs(edge_context.range?.[1] - view_end) < 2;
+
+        const source_states =
+          context_matches && edge_context.rows?.length
+            ? edge_context.rows
+                .map((row) => row?.state)
+                .filter(Boolean)
+            : states;
+
         const is_missing_temp = (v) => {
           if (v === null || v === undefined) return true;
           const s = String(v).trim().toLowerCase();
@@ -549,8 +650,8 @@ entities:
         // remain separate samples.
         const by_source_ts = new Map();
 
-        for (let i = 0; i < states.length; i++) {
-          const st = states[i];
+        for (let i = 0; i < source_states.length; i++) {
+          const st = source_states[i];
           const t = to_ms(st?.attributes?.source_ts);
           if (!Number.isFinite(t)) continue;
 
@@ -694,10 +795,17 @@ entities:
             interpolated: row.interpolated
           };
 
+          const is_offscreen =
+            Number.isFinite(view_start) &&
+            Number.isFinite(view_end) &&
+            (row.t < view_start || row.t > view_end);
+
           vars.outdoor_temp_marker_sizes[j] =
-            row.interpolated
-              ? cfg.OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX
-              : cfg.OUTDOOR_TEMP_MARKER_SIZE_PX;
+            is_offscreen
+              ? 0
+              : row.interpolated
+                ? cfg.OUTDOOR_TEMP_INTERP_MARKER_SIZE_PX
+                : cfg.OUTDOOR_TEMP_MARKER_SIZE_PX;
         }
 
         // Plotly scatter text does not auto-place or avoid collisions for us.
@@ -710,9 +818,8 @@ entities:
         // This allows a daily high and daily low to coexist even when close in
         // time, and lets minima prefer positions below the trough while maxima
         // prefer positions above the crest.
-        const visible = getFromConfig("visible_range");
-        let x0 = to_ms(visible?.[0]);
-        let x1 = to_ms(visible?.[1]);
+        let x0 = view_start;
+        let x1 = view_end;
 
         if (
           !Number.isFinite(x0) ||
@@ -1587,7 +1694,13 @@ entities:
 
         for (let j = 0; j < plotted_rows.length; j++) {
           const row = plotted_rows[j];
-          if (row.y === null) continue;
+          if (
+            row.y === null ||
+            row.t < x0 ||
+            row.t > x1
+          ) {
+            continue;
+          }
 
           const is_endpoint =
             j === 0 ||
@@ -1765,6 +1878,8 @@ entities:
       shape: spline
       smoothing: $ex vars.cfg.OUTDOOR_TEMP_SMOOTHING
 
+    connectgaps: false
+
     marker:
       color: $ex vars.cfg.OUTDOOR_TEMP_COLOR
       size: $ex vars.outdoor_temp_marker_sizes
@@ -1795,11 +1910,14 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV51Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV52Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
       const PREFETCH_MAX_MS = 60 * 60 * 1000;
+      const POWER_EDGE_CONTEXT_MIN_MS = 60 * 1000;
+      const TEMP_EDGE_CONTEXT_MS = 4 * 60 * 60 * 1000;
+      const EDGE_CONTEXT_KEY = "__acCondenserEdgeContextV52";
 
       window[STATE_KEY] ??= {
         power: true,
@@ -2275,6 +2393,30 @@ layout:
         delete window.__acCondenserPlotV51Runtime;
       }
 
+      // Clean an earlier v52 runtime if this YAML is hot-reloaded.
+      const stale_v52 = window.__acCondenserPlotV52Runtime;
+      if (stale_v52) {
+        if (stale_v52.on_click) {
+          window.removeEventListener("click", stale_v52.on_click, true);
+        }
+        if (stale_v52.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v52.on_pointerdown, true);
+        }
+        if (stale_v52.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v52.on_touchstart, true);
+        }
+        if (stale_v52.on_wheel) {
+          window.removeEventListener("wheel", stale_v52.on_wheel, true);
+        }
+        if (stale_v52.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v52.on_pointerup, true);
+        }
+        if (stale_v52.initialize_timer_ids) {
+          stale_v52.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV52Runtime;
+      }
+
       const is_target_card = (el) => {
         if (el?.localName !== "plotly-graph") return false;
         const ents = el.config?.entities ?? [];
@@ -2405,19 +2547,38 @@ layout:
         cache.__acCondenserV28OriginalGetData = original_get_data;
         cache.__acCondenserV28OriginalFetch = original_fetch;
 
-        // Avoid constructing arrays for the entire accumulated history. Binary
-        // search the sorted cache and fill only viewport-adjacent rows directly,
-        // avoiding v27's intermediate history.slice() allocation and map passes.
+        // Avoid constructing arrays for the entire accumulated history.
+        //
+        // v52 also captures REAL points just outside the visible X range for
+        // Total and Outdoor Temperature. The graph-card parser later performs
+        // its own asymmetric removeOutOfRange() operation, but the entity fns
+        // restore these real off-screen samples from EDGE_CONTEXT_KEY. Plotly's
+        // own subplot clip-path then cuts the line at the exact screen edge.
         cache.getData = (entity) => {
           if (
             !entity?.entity ||
-            Object.prototype.hasOwnProperty.call(entity, "attribute") ||
             Object.prototype.hasOwnProperty.call(entity, "statistic")
           ) {
             return original_get_data(entity);
           }
 
-          const history = cache.histories?.[entity.entity] ?? [];
+          const has_attribute =
+            Object.prototype.hasOwnProperty.call(entity, "attribute");
+
+          const is_power =
+            !has_attribute &&
+            entity.entity === "sensor.ac_total_power";
+
+          const is_temperature =
+            has_attribute &&
+            entity.entity === "sensor.outdoor_temperature";
+
+          const key =
+            has_attribute
+              ? `${entity.entity}::attribute:`
+              : entity.entity;
+
+          const history = cache.histories?.[key] ?? [];
           const range = desired_data_range(host);
 
           if (!range || history.length === 0) {
@@ -2448,41 +2609,110 @@ layout:
             return lo;
           };
 
-          // Keep one real point on each side when available. The parser's
-          // normal removeOutOfRange() then preserves its existing edge behavior.
-          const first = Math.max(0, lower_bound(start) - 1);
-          const last = Math.min(history.length, upper_bound(end) + 1);
-          const count = Math.max(0, last - first);
+          const y_for_row = (row) => {
+            const state = row?.state;
+            const y =
+              has_attribute
+                ? state?.attributes?.[entity.attribute]
+                : state?.state;
 
-          const xs = new Array(count);
-          const ys = new Array(count);
-          const states = new Array(count);
-
-          for (let i = 0; i < count; i++) {
-            const row = history[first + i];
-            const state = row.state;
-            const y = state?.state;
-
-            xs[i] = row.x;
-            states[i] = state;
-            ys[i] =
+            return (
               y === "unavailable" ||
               y === "none" ||
               y === "unknown"
-                ? null
-                : y;
-          }
-
-          if (host.configParser) {
-            host.configParser.observed_range = range.slice();
-          }
-
-          return {
-            xs,
-            ys,
-            states,
-            statistics: []
+            )
+              ? null
+              : y;
           };
+
+          const make_data = (first, last) => {
+            const count = Math.max(0, last - first);
+            const xs = new Array(count);
+            const ys = new Array(count);
+            const states = new Array(count);
+
+            for (let i = 0; i < count; i++) {
+              const row = history[first + i];
+              xs[i] = row.x;
+              states[i] = row.state;
+              ys[i] = y_for_row(row);
+            }
+
+            if (host.configParser) {
+              host.configParser.observed_range = range.slice();
+            }
+
+            return {
+              xs,
+              ys,
+              states,
+              statistics: []
+            };
+          };
+
+          if (is_power || is_temperature) {
+            let context_first;
+            let context_last;
+
+            if (is_temperature) {
+              // Temperature is only about hourly, and its explicit interpolation
+              // rule needs enough data on BOTH sides of the viewport to decide
+              // whether an unknown block is interpolatable. Four hours exceeds
+              // the 3.2 h rule while allowing reporting jitter.
+              context_first = Math.max(
+                0,
+                lower_bound(start - TEMP_EDGE_CONTEXT_MS) - 1
+              );
+              context_last = Math.min(
+                history.length,
+                upper_bound(end + TEMP_EDGE_CONTEXT_MS) + 1
+              );
+            } else {
+              // Linear Total needs only its neighboring real samples. Retain two
+              // on either side defensively so a null/gap immediately adjacent to
+              // the viewport is preserved too.
+              context_first = Math.max(
+                0,
+                lower_bound(start) - 2
+              );
+              context_last = Math.min(
+                history.length,
+                upper_bound(end) + 2
+              );
+            }
+
+            const rows = [];
+            for (let i = context_first; i < context_last; i++) {
+              const row = history[i];
+              rows.push({
+                x: +row.x,
+                state: row.state
+              });
+            }
+
+            window[EDGE_CONTEXT_KEY] ??= {};
+            window[EDGE_CONTEXT_KEY][
+              is_power ? "power" : "temperature"
+            ] = {
+              range: [start, end],
+              rows
+            };
+
+            // Return the same small context to the parser. It may trim/move
+            // boundary points, but the entity fn below deliberately rebuilds
+            // from the untouched copy stored above.
+            return make_data(context_first, context_last);
+          }
+
+          if (has_attribute) {
+            return original_get_data(entity);
+          }
+
+          // Ordinary state traces (currently Stage 2): preserve the fast v28
+          // viewport slice and the card's existing edge behavior.
+          const first = Math.max(0, lower_bound(start) - 1);
+          const last = Math.min(history.length, upper_bound(end) + 1);
+          return make_data(first, last);
         };
 
         // Fetch a small margin beyond the requested viewport. This costs little
@@ -2496,10 +2726,30 @@ layout:
 
           const [start, end] = normalized;
           const width = end - start;
-          const margin = Math.min(
+          let margin = Math.min(
             width * PREFETCH_FRACTION,
             PREFETCH_MAX_MS
           );
+
+          if (
+            entity?.entity === "sensor.ac_total_power" &&
+            !Object.prototype.hasOwnProperty.call(entity, "attribute")
+          ) {
+            margin = Math.max(
+              margin,
+              POWER_EDGE_CONTEXT_MIN_MS
+            );
+          }
+
+          if (
+            entity?.entity === "sensor.outdoor_temperature" &&
+            Object.prototype.hasOwnProperty.call(entity, "attribute")
+          ) {
+            margin = Math.max(
+              margin,
+              TEMP_EDGE_CONTEXT_MS
+            );
+          }
 
           return original_fetch(
             [start - margin, end + margin],
@@ -2974,7 +3224,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v51";
+      return "ac-condenser-v52";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
