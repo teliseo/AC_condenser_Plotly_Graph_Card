@@ -1,8 +1,8 @@
 # Home Assistant Plotly Graph Card
 # A/C condenser power, with clipped display rails and Stage-2 emphasis.
-# v52: v51 behavior plus real off-screen edge context for Total and Temperature.
-# Plotly clips lines/splines at the X-axis edges using real neighboring samples,
-# avoiding plotly-graph-card's asymmetric synthetic-left/truncated-right behavior.
+# v53: v52 behavior with true nearest-neighbor edge fetching for Total.
+# A fixed time margin is no longer assumed to contain an adjacent Total sample:
+# missing left/right neighbors are searched geometrically until found.
 #
 # Paste this entire file into the card's "Show code editor" in a
 # GUI-managed Home Assistant dashboard.
@@ -228,7 +228,7 @@ entities:
         const view_end = to_ms(visible?.[1]);
 
         const edge_context =
-          window.__acCondenserEdgeContextV52?.power;
+          window.__acCondenserEdgeContextV53?.power;
 
         const context_matches =
           edge_context &&
@@ -617,7 +617,7 @@ entities:
         const view_end = to_ms(visible?.[1]);
 
         const edge_context =
-          window.__acCondenserEdgeContextV52?.temperature;
+          window.__acCondenserEdgeContextV53?.temperature;
 
         const context_matches =
           edge_context &&
@@ -1910,14 +1910,16 @@ layout:
   meta: |
     $fn () => {
       const STATE_KEY = "__acCondenserPlotV22State";
-      const RUNTIME_KEY = "__acCondenserPlotV52Runtime";
+      const RUNTIME_KEY = "__acCondenserPlotV53Runtime";
       const OLD_RUNTIME_KEY = "__acCondenserPlotV28Runtime";
       const INTERACTION_DEBOUNCE_MS = 225;
       const PREFETCH_FRACTION = 0.25;
       const PREFETCH_MAX_MS = 60 * 60 * 1000;
-      const POWER_EDGE_CONTEXT_MIN_MS = 60 * 1000;
+      const POWER_EDGE_SEARCH_INITIAL_MS = 60 * 1000;
+      const POWER_EDGE_SEARCH_FACTOR = 4;
+      const POWER_EDGE_SEARCH_MAX_MS = 365 * 24 * 60 * 60 * 1000;
       const TEMP_EDGE_CONTEXT_MS = 4 * 60 * 60 * 1000;
-      const EDGE_CONTEXT_KEY = "__acCondenserEdgeContextV52";
+      const EDGE_CONTEXT_KEY = "__acCondenserEdgeContextV53";
 
       window[STATE_KEY] ??= {
         power: true,
@@ -2417,6 +2419,30 @@ layout:
         delete window.__acCondenserPlotV52Runtime;
       }
 
+      // Clean an earlier v53 runtime if this YAML is hot-reloaded.
+      const stale_v53 = window.__acCondenserPlotV53Runtime;
+      if (stale_v53) {
+        if (stale_v53.on_click) {
+          window.removeEventListener("click", stale_v53.on_click, true);
+        }
+        if (stale_v53.on_pointerdown) {
+          window.removeEventListener("pointerdown", stale_v53.on_pointerdown, true);
+        }
+        if (stale_v53.on_touchstart) {
+          window.removeEventListener("touchstart", stale_v53.on_touchstart, true);
+        }
+        if (stale_v53.on_wheel) {
+          window.removeEventListener("wheel", stale_v53.on_wheel, true);
+        }
+        if (stale_v53.on_pointerup) {
+          window.removeEventListener("pointerup", stale_v53.on_pointerup, true);
+        }
+        if (stale_v53.initialize_timer_ids) {
+          stale_v53.initialize_timer_ids.forEach(clearTimeout);
+        }
+        delete window.__acCondenserPlotV53Runtime;
+      }
+
       const is_target_card = (el) => {
         if (el?.localName !== "plotly-graph") return false;
         const ents = el.config?.entities ?? [];
@@ -2668,22 +2694,43 @@ layout:
                 upper_bound(end + TEMP_EDGE_CONTEXT_MS) + 1
               );
             } else {
-              // Linear Total needs only its neighboring real samples. Retain two
-              // on either side defensively so a null/gap immediately adjacent to
-              // the viewport is preserved too.
-              context_first = Math.max(
-                0,
-                lower_bound(start) - 2
-              );
-              context_last = Math.min(
-                history.length,
-                upper_bound(end) + 2
-              );
+              // Total uses the REAL nearest Recorder state on each side.
+              // Home Assistant history may leave one synthetic
+              // fake_boundary_datapoint at the beginning of the cache; never
+              // use that as geometric context because its timestamp is not the
+              // timestamp of the actual state change.
+              const first_visible = lower_bound(start);
+              const after_visible = upper_bound(end);
+
+              let previous_real = null;
+              for (let i = first_visible - 1; i >= 0; i--) {
+                if (!history[i]?.fake_boundary_datapoint) {
+                  previous_real = i;
+                  break;
+                }
+              }
+
+              let next_real = null;
+              for (let i = after_visible; i < history.length; i++) {
+                if (!history[i]?.fake_boundary_datapoint) {
+                  next_real = i;
+                  break;
+                }
+              }
+
+              context_first =
+                previous_real ?? first_visible;
+              context_last =
+                next_real !== null
+                  ? next_real + 1
+                  : after_visible;
             }
 
             const rows = [];
             for (let i = context_first; i < context_last; i++) {
               const row = history[i];
+              if (!row || row.fake_boundary_datapoint) continue;
+
               rows.push({
                 x: +row.x,
                 state: row.state
@@ -2715,10 +2762,14 @@ layout:
           return make_data(first, last);
         };
 
-        // Fetch a small margin beyond the requested viewport. This costs little
-        // when zoomed in, is capped at one hour per side, and means nearby
-        // follow-up pans can usually reuse Recorder history already in cache.
-        cache.fetch = (range, entity, hass) => {
+        // Fetch a small ordinary prefetch margin for interaction performance.
+        //
+        // Total is special: after the ordinary fetch, verify that the cache
+        // actually contains the REAL immediately-previous and immediately-next
+        // Recorder states around the requested viewport. If either is absent,
+        // search outward geometrically. This removes the false assumption that
+        // "N seconds of margin" necessarily contains a sample.
+        cache.fetch = async (range, entity, hass) => {
           const normalized = normalize_range(range);
           if (!normalized) {
             return original_fetch(range, entity, hass);
@@ -2726,36 +2777,132 @@ layout:
 
           const [start, end] = normalized;
           const width = end - start;
+
+          const has_attribute =
+            Object.prototype.hasOwnProperty.call(entity ?? {}, "attribute");
+
+          const is_power =
+            entity?.entity === "sensor.ac_total_power" &&
+            !has_attribute;
+
+          const is_temperature =
+            entity?.entity === "sensor.outdoor_temperature" &&
+            has_attribute;
+
           let margin = Math.min(
             width * PREFETCH_FRACTION,
             PREFETCH_MAX_MS
           );
 
-          if (
-            entity?.entity === "sensor.ac_total_power" &&
-            !Object.prototype.hasOwnProperty.call(entity, "attribute")
-          ) {
-            margin = Math.max(
-              margin,
-              POWER_EDGE_CONTEXT_MIN_MS
-            );
-          }
-
-          if (
-            entity?.entity === "sensor.outdoor_temperature" &&
-            Object.prototype.hasOwnProperty.call(entity, "attribute")
-          ) {
+          if (is_temperature) {
             margin = Math.max(
               margin,
               TEMP_EDGE_CONTEXT_MS
             );
           }
 
-          return original_fetch(
+          // First do the normal viewport/prefetch request. Cache.fetch itself
+          // subtracts already-known ranges, so this remains cheap on repeat.
+          let result = await original_fetch(
             [start - margin, end + margin],
             entity,
             hass
           );
+
+          if (!is_power) {
+            return result;
+          }
+
+          const key = entity.entity;
+
+          const find_real_neighbor = (side) => {
+            const history = cache.histories?.[key] ?? [];
+
+            if (side === "left") {
+              for (let i = history.length - 1; i >= 0; i--) {
+                const row = history[i];
+                if (
+                  +row.x < start &&
+                  !row.fake_boundary_datapoint
+                ) {
+                  return row;
+                }
+              }
+              return null;
+            }
+
+            for (let i = 0; i < history.length; i++) {
+              const row = history[i];
+              if (
+                +row.x > end &&
+                !row.fake_boundary_datapoint
+              ) {
+                return row;
+              }
+            }
+            return null;
+          };
+
+          const search_for_neighbor = async (side) => {
+            if (find_real_neighbor(side)) {
+              return true;
+            }
+
+            // There can be no right-side historical neighbor beyond "now".
+            if (
+              side === "right" &&
+              end >= Date.now() - 1000
+            ) {
+              return false;
+            }
+
+            let span = POWER_EDGE_SEARCH_INITIAL_MS;
+
+            while (span <= POWER_EDGE_SEARCH_MAX_MS) {
+              const search_range =
+                side === "left"
+                  ? [start - span, start]
+                  : [
+                      end,
+                      Math.min(
+                        Date.now(),
+                        end + span
+                      )
+                    ];
+
+              if (search_range[1] <= search_range[0]) {
+                return false;
+              }
+
+              result = await original_fetch(
+                search_range,
+                entity,
+                hass
+              );
+
+              if (find_real_neighbor(side)) {
+                return true;
+              }
+
+              if (
+                side === "right" &&
+                search_range[1] >= Date.now()
+              ) {
+                return false;
+              }
+
+              span *= POWER_EDGE_SEARCH_FACTOR;
+            }
+
+            return false;
+          };
+
+          await search_for_neighbor("left");
+          await search_for_neighbor("right");
+
+          // Return through the patched getData so the freshly-found neighbors
+          // are copied into EDGE_CONTEXT_KEY for the Total entity function.
+          return cache.getData(entity);
         };
 
         cache.__acCondenserV28Patched = true;
@@ -3224,7 +3371,7 @@ layout:
         };
       }
 
-      return "ac-condenser-v52";
+      return "ac-condenser-v53";
     }
 
   # In a Panel view, this makes the graph approximately fill the browser
